@@ -21,3 +21,9 @@ firebase-debug.log
 
 # OS
 .DS_Store
+
+# local secrets & recordings (PoC)
+secrets/
+data/
+*.webm
+*.txt
