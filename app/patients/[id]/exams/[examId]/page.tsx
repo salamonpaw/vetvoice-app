@@ -16,9 +16,28 @@ type ExamDoc = {
   status: ExamStatus;
   createdAt?: any;
   updatedAt?: any;
+
   transcript?: string;
   transcriptRaw?: string;
+
+  analysis?: {
+    sections?: {
+      reason?: string | null;
+      findings?: string | null;
+      conclusions?: string | null;
+      recommendations?: string | null;
+    };
+  };
+  analysisMissing?: {
+    reason?: boolean;
+    findings?: boolean;
+    conclusions?: boolean;
+    recommendations?: boolean;
+  };
+  analysisMeta?: any;
+
   report?: string;
+
   recording?: {
     storage: "local" | "firebase";
     localPath?: string;
@@ -30,6 +49,8 @@ type ExamDoc = {
     expiresAt?: any;
   };
 };
+
+type PipelineStep = "idle" | "transcribing" | "analyzing" | "generating" | "done" | "error";
 
 function fmtMs(ms: number) {
   const totalSec = Math.floor(ms / 1000);
@@ -52,7 +73,6 @@ function addDaysISO(days: number) {
   return d.toISOString();
 }
 
-// Bezpieczne czytanie odpowiedzi (JSON albo tekst)
 async function readJsonOrText(res: Response) {
   const contentType = res.headers.get("content-type") || "";
   const text = await res.text();
@@ -68,11 +88,28 @@ async function readJsonOrText(res: Response) {
   return { kind: "text" as const, json: null, text };
 }
 
+function pipelineLabel(step: PipelineStep) {
+  switch (step) {
+    case "idle":
+      return "—";
+    case "transcribing":
+      return "Transkrypcja…";
+    case "analyzing":
+      return "Analiza (LLM)…";
+    case "generating":
+      return "Generowanie raportu…";
+    case "done":
+      return "Gotowe ✅";
+    case "error":
+      return "Błąd ❌";
+  }
+}
+
 export default function ExamPage() {
   const router = useRouter();
   const params = useParams<{ id: string; examId: string }>();
 
-  const patientId = Array.isArray(params?.id) ? params.id[0] : params?.id;
+  const patientIdFromParams = Array.isArray(params?.id) ? params.id[0] : params?.id;
   const examId = Array.isArray(params?.examId) ? params.examId[0] : params?.examId;
 
   const [loading, setLoading] = useState(true);
@@ -81,6 +118,9 @@ export default function ExamPage() {
 
   const [exam, setExam] = useState<ExamDoc | null>(null);
   const [clinicId, setClinicId] = useState("");
+
+  const [pipelineStep, setPipelineStep] = useState<PipelineStep>("idle");
+  const [pipelineMsg, setPipelineMsg] = useState("");
 
   // MediaRecorder state
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -103,16 +143,23 @@ export default function ExamPage() {
   const [generatingReport, setGeneratingReport] = useState(false);
   const [savingReport, setSavingReport] = useState(false);
   const [reportDraft, setReportDraft] = useState("");
+  const [reportDirty, setReportDirty] = useState(false);
+
+  // IMPORTANT: ref do natychmiastowego “dirty” (eliminuje race: setState vs load())
+  const reportDirtyRef = useRef(false);
 
   const examRef = useMemo(() => {
-    if (!patientId || !examId) return null;
-    return doc(db, "patients", patientId, "exams", examId);
-  }, [patientId, examId]);
+    if (!patientIdFromParams || !examId) return null;
+    return doc(db, "patients", patientIdFromParams, "exams", examId);
+  }, [patientIdFromParams, examId]);
 
   const canRecord = exam?.status === "in_progress";
   const hasLocalRecording = !!exam?.recording?.localPath;
   const hasTranscript = !!exam?.transcript;
   const transcriptToShow = showRaw ? exam?.transcriptRaw : exam?.transcript;
+
+  const missing = exam?.analysisMissing;
+  const hasAnyAnalysis = !!exam?.analysis?.sections || !!exam?.analysisMissing;
 
   // timer tick
   useEffect(() => {
@@ -147,6 +194,16 @@ export default function ExamPage() {
     mediaStreamRef.current = null;
   }
 
+  function getCidFromStateOrExam(e?: ExamDoc | null) {
+    return clinicId || e?.clinicId || "demo-clinic";
+  }
+
+  async function fetchFreshExam(): Promise<ExamDoc | null> {
+    if (!examRef) return null;
+    const snap = await getDoc(examRef);
+    return snap.exists() ? (snap.data() as ExamDoc) : null;
+  }
+
   async function load() {
     if (!examRef) return;
     setLoading(true);
@@ -161,7 +218,12 @@ export default function ExamPage() {
       const data = snap.exists() ? (snap.data() as ExamDoc) : null;
 
       setExam(data);
-      setReportDraft(data?.report || "");
+
+      // NIE NADPISUJ raportu jeśli user zaczął edycję / pipeline już wstawił draft
+      // Uwaga: używamy ref, żeby uniknąć race condition (setReportDirty(true) vs load()).
+      if (!reportDirtyRef.current) {
+        setReportDraft(data?.report || "");
+      }
     } catch (e: any) {
       setErr(e?.message || "Błąd ładowania");
     } finally {
@@ -300,7 +362,7 @@ export default function ExamPage() {
       setErr("Brak nagrania do zapisania.");
       return;
     }
-    if (!examRef || !patientId || !examId) {
+    if (!examRef || !patientIdFromParams || !examId) {
       setErr("Brak parametrów ścieżki (patientId/examId).");
       return;
     }
@@ -314,13 +376,12 @@ export default function ExamPage() {
       const form = new FormData();
       form.append("file", recordedBlob, "recording.webm");
       form.append("clinicId", clinicId);
-      form.append("patientId", patientId);
+      form.append("patientId", patientIdFromParams);
       form.append("examId", examId);
       form.append("durationMs", String(elapsedMs));
 
       const res = await fetch("/api/recordings", { method: "POST", body: form });
       const parsed = await readJsonOrText(res);
-
       const json = (parsed.kind === "json" ? parsed.json : null) as any;
 
       if (!res.ok || !json?.ok) {
@@ -343,7 +404,6 @@ export default function ExamPage() {
       });
 
       await load();
-      setErr("");
 
       // reset po zapisie
       setRecState("idle");
@@ -367,7 +427,7 @@ export default function ExamPage() {
     setErr("");
     setOkMsg("");
 
-    if (!patientId || !examId) {
+    if (!patientIdFromParams || !examId) {
       setErr("Brak patientId/examId.");
       return;
     }
@@ -381,7 +441,7 @@ export default function ExamPage() {
       const res = await fetch("/api/exams/transcribe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ patientId, examId }),
+        body: JSON.stringify({ patientId: patientIdFromParams, examId }),
       });
 
       const parsed = await readJsonOrText(res);
@@ -392,7 +452,6 @@ export default function ExamPage() {
       }
 
       await load();
-      setErr("");
       setOkMsg("✅ Transkrypcja gotowa");
     } catch (e: any) {
       setErr(e?.message || "Błąd transkrypcji");
@@ -402,60 +461,161 @@ export default function ExamPage() {
     }
   }
 
-  async function setInProgress() {
+  async function analyzeNow() {
     setErr("");
     setOkMsg("");
 
-    if (!examRef) return;
-
-    try {
-      await updateDoc(examRef, {
-        status: "in_progress",
-        updatedAt: serverTimestamp(),
-      });
-      await load();
-      setOkMsg("✅ Status ustawiony na: W trakcie");
-    } catch (e: any) {
-      setErr(e?.message || "Nie udało się zmienić statusu badania.");
+    if (!patientIdFromParams || !examId) {
+      setErr("Brak patientId/examId.");
+      return;
     }
+
+    // UWAGA: nie blokuj się na exam?.transcript ze starego state
+    const fresh = await fetchFreshExam();
+    if (!fresh?.transcript || !fresh.transcript.trim()) {
+      setErr("Brak transkrypcji — analiza wymaga transkrypcji.");
+      return;
+    }
+
+    const cid = getCidFromStateOrExam(fresh);
+
+    const res = await fetch("/api/exams/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clinicId: cid, patientId: patientIdFromParams, examId }),
+    });
+
+    const parsed = await readJsonOrText(res);
+    const json = (parsed.kind === "json" ? parsed.json : null) as any;
+
+    if (!res.ok || !json?.ok) {
+      throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`);
+    }
+
+    await load();
   }
 
   async function generateReportNow() {
     setErr("");
     setOkMsg("");
 
-    if (!patientId || !examId) {
+    if (!patientIdFromParams || !examId) {
       setErr("Brak patientId/examId.");
-      return;
-    }
-    if (!exam?.transcript) {
-      setErr("Brak transkrypcji — najpierw wykonaj transkrypcję.");
       return;
     }
 
     setGeneratingReport(true);
     try {
+      // bierz fresh (unikasz problemu “1 klik nic / 2 klik działa”)
+      const fresh = await fetchFreshExam();
+      const cid = getCidFromStateOrExam(fresh);
+
       const res = await fetch("/api/exams/generate-report", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ patientId, examId }),
+        body: JSON.stringify({ clinicId: cid, patientId: patientIdFromParams, examId }),
       });
 
       const parsed = await readJsonOrText(res);
       const json = (parsed.kind === "json" ? parsed.json : null) as any;
 
       if (!res.ok || !json?.ok) {
-        throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`);
+        throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 800)}`);
+      }
+
+      // Backend może zwracać reportPreview (Twoja wersja) albo report (jeśli dodasz)
+      const maybeReport =
+        (typeof json?.report === "string" && json.report.trim() ? json.report : "") ||
+        (typeof json?.reportPreview === "string" && json.reportPreview.trim() ? json.reportPreview : "");
+
+      if (maybeReport) {
+        setReportDraft(maybeReport);
+
+        // kluczowe: ustaw ref natychmiast, zanim zrobimy load()
+        reportDirtyRef.current = true;
+        setReportDirty(true); // (stan UI)
       }
 
       await load();
-      setErr("");
       setOkMsg("✅ Raport wygenerowany");
     } catch (e: any) {
       setErr(e?.message || "Błąd generowania raportu");
       setOkMsg("");
     } finally {
       setGeneratingReport(false);
+    }
+  }
+
+  async function runAutoReportPipeline() {
+    setErr("");
+    setOkMsg("");
+    setPipelineMsg("");
+
+    if (!patientIdFromParams || !examId) {
+      setErr("Brak patientId/examId.");
+      return;
+    }
+
+    try {
+      let fresh = await fetchFreshExam();
+      if (!fresh) throw new Error("Brak badania (nie znaleziono dokumentu w Firestore).");
+
+      // 1) Transkrypcja (jeśli brak)
+      if (!fresh.transcript || !fresh.transcript.trim()) {
+        if (!fresh.recording?.localPath) {
+          throw new Error("Brak transkrypcji i brak lokalnego nagrania (recording.localPath) — nie da się kontynuować.");
+        }
+
+        setPipelineStep("transcribing");
+        setTranscribing(true);
+
+        const res = await fetch("/api/exams/transcribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ patientId: patientIdFromParams, examId }),
+        });
+
+        const parsed = await readJsonOrText(res);
+        const json = (parsed.kind === "json" ? parsed.json : null) as any;
+
+        if (!res.ok || !json?.ok) {
+          throw new Error(json?.error || `Transkrypcja: HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`);
+        }
+
+        await load();
+        fresh = await fetchFreshExam();
+        if (!fresh?.transcript || !fresh.transcript.trim()) {
+          throw new Error("Transkrypcja nie została zapisana (sprawdź /api/exams/transcribe oraz logi serwera).");
+        }
+      }
+
+      // 2) Analiza LLM (jeśli brak)
+      if (!fresh.analysis?.sections) {
+        setPipelineStep("analyzing");
+        await analyzeNow();
+
+        fresh = await fetchFreshExam();
+        if (!fresh?.analysis?.sections) {
+          throw new Error("Analiza nie została zapisana (sprawdź /api/exams/analyze).");
+        }
+      }
+
+      // 3) Raport
+      setPipelineStep("generating");
+      await generateReportNow();
+
+      // Final refresh (dla kompletności)
+      await load();
+
+      setPipelineStep("done");
+      setPipelineMsg("Gotowe ✅");
+    } catch (e: any) {
+      setPipelineStep("error");
+      setPipelineMsg(e?.message || "Błąd pipeline");
+      setErr(e?.message || "Błąd pipeline");
+      setOkMsg("");
+    } finally {
+      setTranscribing(false);
     }
   }
 
@@ -474,8 +634,12 @@ export default function ExamPage() {
         report: reportDraft,
         updatedAt: serverTimestamp(),
       });
+
+      // po zapisie raport nie jest “dirty”
+      reportDirtyRef.current = false;
+      setReportDirty(false);
+
       await load();
-      setErr("");
       setOkMsg("✅ Raport zapisany");
     } catch (e: any) {
       setErr(e?.message || "Błąd zapisu raportu");
@@ -485,10 +649,32 @@ export default function ExamPage() {
     }
   }
 
+  async function setInProgress() {
+    setErr("");
+    setOkMsg("");
+    if (!examRef) return;
+
+    try {
+      await updateDoc(examRef, {
+        status: "in_progress",
+        updatedAt: serverTimestamp(),
+      });
+      await load();
+      setOkMsg("✅ Status ustawiony na: W trakcie");
+    } catch (e: any) {
+      setErr(e?.message || "Nie udało się zmienić statusu badania.");
+    }
+  }
+
   if (loading) return <div className="p-6">Ładowanie…</div>;
   if (!exam) return <div className="p-6">Brak badania</div>;
 
-  const uiLocked = savingAudio || transcribing || generatingReport || savingReport;
+  const uiLocked =
+    savingAudio ||
+    transcribing ||
+    generatingReport ||
+    savingReport ||
+    (pipelineStep !== "idle" && pipelineStep !== "done" && pipelineStep !== "error");
 
   const canStart = canRecord && !uiLocked && recState === "idle";
   const canPause = canRecord && !uiLocked && recState === "recording";
@@ -496,16 +682,20 @@ export default function ExamPage() {
   const canStop = canRecord && !uiLocked && (recState === "recording" || recState === "paused");
   const canSave = !!recordedBlob && !uiLocked;
 
+  const backPid = exam?.patientId || patientIdFromParams;
+
   return (
     <div className="p-6 space-y-6">
       {err && <div className="rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-700">{err}</div>}
       {okMsg && <div className="rounded-lg border border-green-300 bg-green-50 p-3 text-sm text-green-800">{okMsg}</div>}
 
+      {/* HEADER */}
       <div className="flex items-start justify-between gap-4">
         <div>
           <div className="text-xl font-semibold">{typeLabel(exam.type)}</div>
           <div className="mt-1 text-sm opacity-70">
-            Patient: <span className="font-mono">{patientId}</span> • Exam: <span className="font-mono">{examId}</span>
+            Patient: <span className="font-mono">{patientIdFromParams}</span> • Exam:{" "}
+            <span className="font-mono">{examId}</span>
           </div>
         </div>
 
@@ -518,7 +708,16 @@ export default function ExamPage() {
             </button>
           )}
 
-          <button className="rounded-lg border px-3 py-2 text-sm" onClick={() => router.push(`/patients/${patientId}`)}>
+          <button
+            className="rounded-lg border px-3 py-2 text-sm"
+            onClick={() => {
+              if (!backPid) {
+                setErr("Nie mogę wrócić — brak patientId.");
+                return;
+              }
+              router.push(`/patients/${backPid}`);
+            }}
+          >
             Wróć do pacjenta
           </button>
         </div>
@@ -624,29 +823,70 @@ export default function ExamPage() {
         </section>
       )}
 
-      {/* RAPORT (zawsze widoczny) */}
+      {/* RAPORT */}
       <section className="rounded-2xl border p-4 space-y-4">
         <div className="text-sm font-semibold">Raport</div>
 
         <div className="flex flex-wrap gap-2 items-center">
           <button
             className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
-            onClick={generateReportNow}
-            disabled={uiLocked || !exam?.transcript}
-            title={!exam?.transcript ? "Najpierw wykonaj transkrypcję" : ""}
+            onClick={runAutoReportPipeline}
+            disabled={uiLocked || (!hasLocalRecording && !exam?.transcript && !exam?.analysis?.sections)}
+            title={!hasLocalRecording && !exam?.transcript && !exam?.analysis?.sections ? "Najpierw nagraj i zapisz nagranie lokalnie" : ""}
           >
-            {generatingReport ? "Generuję…" : "Generuj raport"}
+            {pipelineStep !== "idle" && pipelineStep !== "done" && pipelineStep !== "error"
+              ? pipelineLabel(pipelineStep)
+              : "Generuj raport"}
           </button>
 
           <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" onClick={saveReport} disabled={uiLocked}>
             {savingReport ? "Zapisuję…" : "Zapisz"}
           </button>
+
+          <button
+            className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
+            onClick={transcribeNow}
+            disabled={uiLocked || !hasLocalRecording}
+            title={!hasLocalRecording ? "Brak lokalnego nagrania" : "Wymusza ponowną transkrypcję"}
+          >
+            Wymuś transkrypcję
+          </button>
+
+          <button
+            className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
+            onClick={analyzeNow}
+            disabled={uiLocked || !exam?.transcript}
+            title={!exam?.transcript ? "Brak transkrypcji" : "Wymusza ponowną analizę LLM"}
+          >
+            Wymuś analizę
+          </button>
         </div>
+
+        <div className="text-xs opacity-80">
+          <span className="font-semibold">Pipeline:</span> {pipelineLabel(pipelineStep)}
+          {pipelineMsg ? ` — ${pipelineMsg}` : ""}
+        </div>
+
+        {hasAnyAnalysis && (
+          <div className="rounded-lg border p-3 text-xs space-y-1">
+            <div className="font-semibold">Kompletność (LLM):</div>
+            <div className="flex flex-wrap gap-2">
+              <span className="rounded-full border px-2 py-0.5">Powód: {missing?.reason ? "❌" : "✅"}</span>
+              <span className="rounded-full border px-2 py-0.5">Opis: {missing?.findings ? "❌" : "✅"}</span>
+              <span className="rounded-full border px-2 py-0.5">Wnioski: {missing?.conclusions ? "❌" : "✅"}</span>
+              <span className="rounded-full border px-2 py-0.5">Zalecenia: {missing?.recommendations ? "❌" : "✅"}</span>
+            </div>
+          </div>
+        )}
 
         <textarea
           className="w-full rounded-lg border p-3 text-sm min-h-[240px]"
           value={reportDraft}
-          onChange={(e) => setReportDraft(e.target.value)}
+          onChange={(e) => {
+            setReportDraft(e.target.value);
+            reportDirtyRef.current = true;
+            setReportDirty(true);
+          }}
           placeholder="Tu pojawi się raport. Możesz go edytować ręcznie."
         />
       </section>
