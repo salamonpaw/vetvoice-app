@@ -59,10 +59,6 @@ function fmtMs(ms: number) {
   return `${mm}:${ss}`;
 }
 
-function statusLabel(s: ExamStatus) {
-  return s === "draft" ? "Szkic" : s === "in_progress" ? "W trakcie" : "Zakończone";
-}
-
 function typeLabel(t?: string) {
   return t || "Badanie";
 }
@@ -95,14 +91,34 @@ function pipelineLabel(step: PipelineStep) {
     case "transcribing":
       return "Transkrypcja…";
     case "analyzing":
-      return "Analiza (LLM)…";
+      return "Analiza…";
     case "generating":
-      return "Generowanie raportu…";
+      return "Raport…";
     case "done":
       return "Gotowe ✅";
     case "error":
       return "Błąd ❌";
   }
+}
+
+function tone(kind: "neutral" | "ok" | "warn" | "bad") {
+  switch (kind) {
+    case "ok":
+      return "border-green-200 bg-green-50 text-green-800";
+    case "warn":
+      return "border-amber-200 bg-amber-50 text-amber-800";
+    case "bad":
+      return "border-red-200 bg-red-50 text-red-800";
+    default:
+      return "border-slate-200 bg-slate-50 text-slate-700";
+  }
+}
+
+function stepTone(done: boolean, active: boolean, blocked: boolean) {
+  if (done) return tone("ok");
+  if (active) return tone("warn");
+  if (blocked) return tone("bad");
+  return tone("neutral");
 }
 
 export default function ExamPage() {
@@ -153,7 +169,6 @@ export default function ExamPage() {
     return doc(db, "patients", patientIdFromParams, "exams", examId);
   }, [patientIdFromParams, examId]);
 
-  const canRecord = exam?.status === "in_progress";
   const hasLocalRecording = !!exam?.recording?.localPath;
   const hasTranscript = !!exam?.transcript;
   const transcriptToShow = showRaw ? exam?.transcriptRaw : exam?.transcript;
@@ -220,7 +235,6 @@ export default function ExamPage() {
       setExam(data);
 
       // NIE NADPISUJ raportu jeśli user zaczął edycję / pipeline już wstawił draft
-      // Uwaga: używamy ref, żeby uniknąć race condition (setReportDirty(true) vs load()).
       if (!reportDirtyRef.current) {
         setReportDraft(data?.report || "");
       }
@@ -245,12 +259,32 @@ export default function ExamPage() {
     return "audio/webm";
   }
 
+  async function ensureInProgressBeforeRecording() {
+    if (!examRef) return;
+
+    if (exam?.status !== "in_progress") {
+      await updateDoc(examRef, {
+        status: "in_progress",
+        updatedAt: serverTimestamp(),
+      });
+      const fresh = await fetchFreshExam();
+      if (fresh) setExam(fresh);
+    }
+  }
+
   async function startRecording() {
     setErr("");
     setOkMsg("");
 
-    if (!canRecord) {
-      setErr("Nagrywanie dostępne tylko w statusie: W trakcie.");
+    if (!examRef) {
+      setErr("Brak referencji do badania.");
+      return;
+    }
+
+    try {
+      await ensureInProgressBeforeRecording();
+    } catch (e: any) {
+      setErr(e?.message || "Nie udało się ustawić badania jako: W trakcie.");
       return;
     }
 
@@ -405,7 +439,6 @@ export default function ExamPage() {
 
       await load();
 
-      // reset po zapisie
       setRecState("idle");
       setElapsedMs(0);
       setRecordedBlob(null);
@@ -414,7 +447,7 @@ export default function ExamPage() {
       chunksRef.current = [];
       elapsedBeforePauseRef.current = 0;
 
-      setOkMsg("✅ Nagranie zapisane lokalnie i podpięte do badania.");
+      setOkMsg("✅ Nagranie zapisane.");
     } catch (e: any) {
       setErr(e?.message || "Błąd zapisu");
       setOkMsg("");
@@ -470,7 +503,6 @@ export default function ExamPage() {
       return;
     }
 
-    // UWAGA: nie blokuj się na exam?.transcript ze starego state
     const fresh = await fetchFreshExam();
     if (!fresh?.transcript || !fresh.transcript.trim()) {
       setErr("Brak transkrypcji — analiza wymaga transkrypcji.");
@@ -493,6 +525,7 @@ export default function ExamPage() {
     }
 
     await load();
+    setOkMsg("✅ Analiza gotowa");
   }
 
   async function generateReportNow() {
@@ -506,7 +539,6 @@ export default function ExamPage() {
 
     setGeneratingReport(true);
     try {
-      // bierz fresh (unikasz problemu “1 klik nic / 2 klik działa”)
       const fresh = await fetchFreshExam();
       const cid = getCidFromStateOrExam(fresh);
 
@@ -523,17 +555,14 @@ export default function ExamPage() {
         throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 800)}`);
       }
 
-      // Backend może zwracać reportPreview (Twoja wersja) albo report (jeśli dodasz)
       const maybeReport =
         (typeof json?.report === "string" && json.report.trim() ? json.report : "") ||
         (typeof json?.reportPreview === "string" && json.reportPreview.trim() ? json.reportPreview : "");
 
       if (maybeReport) {
         setReportDraft(maybeReport);
-
-        // kluczowe: ustaw ref natychmiast, zanim zrobimy load()
         reportDirtyRef.current = true;
-        setReportDirty(true); // (stan UI)
+        setReportDirty(true);
       }
 
       await load();
@@ -560,10 +589,9 @@ export default function ExamPage() {
       let fresh = await fetchFreshExam();
       if (!fresh) throw new Error("Brak badania (nie znaleziono dokumentu w Firestore).");
 
-      // 1) Transkrypcja (jeśli brak)
       if (!fresh.transcript || !fresh.transcript.trim()) {
         if (!fresh.recording?.localPath) {
-          throw new Error("Brak transkrypcji i brak lokalnego nagrania (recording.localPath) — nie da się kontynuować.");
+          throw new Error("Brak transkrypcji i brak lokalnego nagrania (recording.localPath).");
         }
 
         setPipelineStep("transcribing");
@@ -585,11 +613,10 @@ export default function ExamPage() {
         await load();
         fresh = await fetchFreshExam();
         if (!fresh?.transcript || !fresh.transcript.trim()) {
-          throw new Error("Transkrypcja nie została zapisana (sprawdź /api/exams/transcribe oraz logi serwera).");
+          throw new Error("Transkrypcja nie została zapisana (sprawdź /api/exams/transcribe).");
         }
       }
 
-      // 2) Analiza LLM (jeśli brak)
       if (!fresh.analysis?.sections) {
         setPipelineStep("analyzing");
         await analyzeNow();
@@ -600,11 +627,9 @@ export default function ExamPage() {
         }
       }
 
-      // 3) Raport
       setPipelineStep("generating");
       await generateReportNow();
 
-      // Final refresh (dla kompletności)
       await load();
 
       setPipelineStep("done");
@@ -635,7 +660,6 @@ export default function ExamPage() {
         updatedAt: serverTimestamp(),
       });
 
-      // po zapisie raport nie jest “dirty”
       reportDirtyRef.current = false;
       setReportDirty(false);
 
@@ -649,23 +673,6 @@ export default function ExamPage() {
     }
   }
 
-  async function setInProgress() {
-    setErr("");
-    setOkMsg("");
-    if (!examRef) return;
-
-    try {
-      await updateDoc(examRef, {
-        status: "in_progress",
-        updatedAt: serverTimestamp(),
-      });
-      await load();
-      setOkMsg("✅ Status ustawiony na: W trakcie");
-    } catch (e: any) {
-      setErr(e?.message || "Nie udało się zmienić statusu badania.");
-    }
-  }
-
   if (loading) return <div className="p-6">Ładowanie…</div>;
   if (!exam) return <div className="p-6">Brak badania</div>;
 
@@ -676,40 +683,68 @@ export default function ExamPage() {
     savingReport ||
     (pipelineStep !== "idle" && pipelineStep !== "done" && pipelineStep !== "error");
 
-  const canStart = canRecord && !uiLocked && recState === "idle";
-  const canPause = canRecord && !uiLocked && recState === "recording";
-  const canResume = canRecord && !uiLocked && recState === "paused";
-  const canStop = canRecord && !uiLocked && (recState === "recording" || recState === "paused");
+  const canStart = !uiLocked && recState === "idle";
+  const canPause = !uiLocked && recState === "recording";
+  const canResume = !uiLocked && recState === "paused";
+  const canStop = !uiLocked && (recState === "recording" || recState === "paused");
   const canSave = !!recordedBlob && !uiLocked;
 
   const backPid = exam?.patientId || patientIdFromParams;
 
-  return (
-    <div className="p-6 space-y-6">
-      {err && <div className="rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-700">{err}</div>}
-      {okMsg && <div className="rounded-lg border border-green-300 bg-green-50 p-3 text-sm text-green-800">{okMsg}</div>}
+  // quiet stepper states
+  const stepRecordingDone = !!exam?.recording?.localPath;
+  const stepTranscriptDone = !!exam?.transcript?.trim();
+  const stepAnalysisDone = !!exam?.analysis?.sections;
+  const stepReportDone = !!exam?.report?.trim() || (!!reportDraft.trim() && reportDirtyRef.current);
 
-      {/* HEADER */}
-      <div className="flex items-start justify-between gap-4">
+  const activeRec = recState === "recording" || recState === "paused";
+  const activeTranscribe = pipelineStep === "transcribing" || transcribing;
+  const activeAnalyze = pipelineStep === "analyzing";
+  const activeReport = pipelineStep === "generating" || generatingReport;
+
+  const transBlocked = !stepRecordingDone;
+  const analyzeBlocked = !stepTranscriptDone;
+  const reportBlocked = !stepAnalysisDone;
+
+  const pipelineTone =
+    pipelineStep === "error" ? tone("bad") : pipelineStep === "done" ? tone("ok") : pipelineStep === "idle" ? tone("neutral") : tone("warn");
+
+  return (
+    <div className="space-y-5">
+      {/* Alerts */}
+      {(err || okMsg) && (
+        <div className="space-y-2">
+          {err && (
+            <div className="rounded-2xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+              <div className="font-semibold">Błąd</div>
+              <div className="mt-1 whitespace-pre-wrap">{err}</div>
+            </div>
+          )}
+          {okMsg && (
+            <div className="rounded-2xl border border-green-200 bg-green-50 p-3 text-sm text-green-900">
+              <div className="font-semibold">OK</div>
+              <div className="mt-1 whitespace-pre-wrap">{okMsg}</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Header */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <div className="text-xl font-semibold">{typeLabel(exam.type)}</div>
-          <div className="mt-1 text-sm opacity-70">
-            Patient: <span className="font-mono">{patientIdFromParams}</span> • Exam:{" "}
-            <span className="font-mono">{examId}</span>
+          <div className="text-xl font-semibold tracking-tight">{typeLabel(exam.type)}</div>
+          <div className="mt-1 text-xs text-slate-500">
+            Patient: <span className="font-mono">{patientIdFromParams}</span> • Exam: <span className="font-mono">{examId}</span>
           </div>
         </div>
 
         <div className="flex items-center gap-2">
-          <span className="rounded-full border px-3 py-1 text-xs">{statusLabel(exam.status)}</span>
-
-          {exam.status !== "in_progress" && (
-            <button className="rounded-lg border px-3 py-2 text-sm" onClick={setInProgress} title="Odblokowuje nagrywanie">
-              Ustaw: W trakcie
-            </button>
-          )}
+          <span className={`rounded-full border px-2.5 py-1 text-xs ${tone(exam.status === "done" ? "ok" : "neutral")}`}>
+            Status: {exam.status === "draft" ? "Szkic" : exam.status === "in_progress" ? "W trakcie" : "Zakończone"}
+          </span>
 
           <button
-            className="rounded-lg border px-3 py-2 text-sm"
+            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50"
             onClick={() => {
               if (!backPid) {
                 setErr("Nie mogę wrócić — brak patientId.");
@@ -718,178 +753,210 @@ export default function ExamPage() {
               router.push(`/patients/${backPid}`);
             }}
           >
-            Wróć do pacjenta
+            Wróć
           </button>
         </div>
       </div>
 
-      {/* NAGRYWANIE */}
-      <section className="rounded-2xl border p-4 space-y-4">
-        <div className="flex items-center justify-between gap-3">
-          <div className="text-sm font-semibold">Nagrywanie</div>
-          <div className="text-sm font-mono">{fmtMs(elapsedMs)}</div>
-        </div>
+      {/* Quiet Stepper */}
+      <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepRecordingDone, activeRec, false)}`}>Nagranie</span>
+          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepTranscriptDone, activeTranscribe, transBlocked)}`}>Transkrypcja</span>
+          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepAnalysisDone, activeAnalyze, analyzeBlocked)}`}>Analiza</span>
+          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepReportDone, activeReport, reportBlocked)}`}>Raport</span>
 
-        {!canRecord && (
-          <div className="text-xs opacity-70">
-            Nagrywanie dostępne tylko dla statusu: <b>W trakcie</b>.
-          </div>
-        )}
-
-        <div className="flex flex-wrap gap-2 items-center">
-          <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" disabled={!canStart} onClick={startRecording}>
-            Start
-          </button>
-
-          <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" disabled={!canPause} onClick={pauseRecording}>
-            Pauza
-          </button>
-
-          <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" disabled={!canResume} onClick={resumeRecording}>
-            Wznów
-          </button>
-
-          <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" disabled={!canStop} onClick={stopRecording}>
-            Stop
-          </button>
-        </div>
-
-        {recordedUrl && (
-          <div className="space-y-2">
-            <div className="text-xs opacity-70">Podgląd lokalny (po Stop):</div>
-            <audio controls src={recordedUrl} className="w-full" />
-            <div className="text-xs opacity-70">
-              MIME: <span className="font-mono">{recordedMime}</span> • Rozmiar:{" "}
-              <span className="font-mono">{recordedBlob?.size ?? 0}</span> B
+          {hasAnyAnalysis && (
+            <div className="ml-1 flex flex-wrap items-center gap-1 text-xs text-slate-500">
+              <span className="ml-1">• Kompletność:</span>
+              <span className={`rounded-full border px-2 py-0.5 ${missing?.reason ? tone("bad") : tone("ok")}`}>Powód</span>
+              <span className={`rounded-full border px-2 py-0.5 ${missing?.findings ? tone("bad") : tone("ok")}`}>Opis</span>
+              <span className={`rounded-full border px-2 py-0.5 ${missing?.conclusions ? tone("bad") : tone("ok")}`}>Wnioski</span>
+              <span className={`rounded-full border px-2 py-0.5 ${missing?.recommendations ? tone("bad") : tone("ok")}`}>Zalecenia</span>
             </div>
-          </div>
-        )}
-
-        <div className="pt-2">
-          <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" disabled={!canSave} onClick={saveRecordingLocal}>
-            {savingAudio ? "Zapisuję lokalnie…" : "Zapisz nagranie (lokalnie)"}
-          </button>
+          )}
         </div>
-      </section>
+      </div>
 
-      {/* NAGRANIE LOKALNE */}
-      {hasLocalRecording && (
-        <section className="rounded-2xl border p-4 space-y-4">
-          <div className="text-sm font-semibold">Nagranie zapisane lokalnie</div>
-
-          <audio controls className="w-full" src={`/api/recordings/file?path=${encodeURIComponent(exam.recording!.localPath!)}`} />
-
-          <div className="rounded-lg border p-3 text-xs space-y-1">
-            <div>
-              Path: <span className="font-mono break-all">{exam.recording!.localPath}</span>
-            </div>
-            {exam.recording?.expiresAt && (
+      {/* Main grid */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
+        {/* Left: one Process card */}
+        <div className="lg:col-span-2">
+          <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm space-y-5">
+            <div className="flex items-start justify-between gap-3">
               <div>
-                Retencja do: <span className="font-mono">{String(exam.recording.expiresAt)}</span>
+                <div className="text-sm font-semibold">Proces</div>
+                <div className="mt-1 text-xs text-slate-500">Nagranie → transkrypcja → analiza → raport</div>
               </div>
-            )}
-          </div>
-        </section>
-      )}
 
-      {/* TRANSKRYPCJA */}
-      {(hasLocalRecording || hasTranscript) && (
-        <section className="rounded-2xl border p-4 space-y-4">
-          <div className="text-sm font-semibold">Transkrypcja</div>
-
-          <div className="flex items-center gap-2">
-            <button className="rounded-lg border px-3 py-1 text-xs disabled:opacity-50" onClick={() => setShowRaw(false)} disabled={!exam.transcript}>
-              Czyste
-            </button>
-
-            <button className="rounded-lg border px-3 py-1 text-xs disabled:opacity-50" onClick={() => setShowRaw(true)} disabled={!exam.transcriptRaw}>
-              Surowe
-            </button>
-          </div>
-
-          {hasLocalRecording && (
-            <div className="flex flex-wrap gap-2 items-center">
-              <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" onClick={transcribeNow} disabled={uiLocked}>
-                {transcribing ? "Transkrybuję…" : "Transkrybuj"}
+              <button
+                className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
+                onClick={runAutoReportPipeline}
+                disabled={uiLocked || (!hasLocalRecording && !exam?.transcript && !exam?.analysis?.sections)}
+                title={!hasLocalRecording && !exam?.transcript && !exam?.analysis?.sections ? "Najpierw nagraj i zapisz nagranie" : ""}
+              >
+                {pipelineStep !== "idle" && pipelineStep !== "done" && pipelineStep !== "error" ? pipelineLabel(pipelineStep) : "Generuj raport"}
               </button>
             </div>
-          )}
 
-          {transcriptToShow ? (
-            <pre className="whitespace-pre-wrap rounded-lg border p-3 text-xs">{transcriptToShow}</pre>
-          ) : (
-            <div className="text-sm opacity-70">Brak transkrypcji — kliknij „Transkrybuj”.</div>
-          )}
-        </section>
-      )}
+            {/* Recording */}
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-semibold">Nagrywanie</div>
+                <div className="text-sm font-mono text-slate-700">{fmtMs(elapsedMs)}</div>
+              </div>
 
-      {/* RAPORT */}
-      <section className="rounded-2xl border p-4 space-y-4">
-        <div className="text-sm font-semibold">Raport</div>
+              <div className="flex flex-wrap gap-2 items-center">
+                <button className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50" disabled={!canStart} onClick={startRecording}>
+                  Start
+                </button>
 
-        <div className="flex flex-wrap gap-2 items-center">
-          <button
-            className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
-            onClick={runAutoReportPipeline}
-            disabled={uiLocked || (!hasLocalRecording && !exam?.transcript && !exam?.analysis?.sections)}
-            title={!hasLocalRecording && !exam?.transcript && !exam?.analysis?.sections ? "Najpierw nagraj i zapisz nagranie lokalnie" : ""}
-          >
-            {pipelineStep !== "idle" && pipelineStep !== "done" && pipelineStep !== "error"
-              ? pipelineLabel(pipelineStep)
-              : "Generuj raport"}
-          </button>
+                <button className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50" disabled={!canPause} onClick={pauseRecording}>
+                  Pauza
+                </button>
 
-          <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" onClick={saveReport} disabled={uiLocked}>
-            {savingReport ? "Zapisuję…" : "Zapisz"}
-          </button>
+                <button className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50" disabled={!canResume} onClick={resumeRecording}>
+                  Wznów
+                </button>
 
-          <button
-            className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
-            onClick={transcribeNow}
-            disabled={uiLocked || !hasLocalRecording}
-            title={!hasLocalRecording ? "Brak lokalnego nagrania" : "Wymusza ponowną transkrypcję"}
-          >
-            Wymuś transkrypcję
-          </button>
+                <button className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50" disabled={!canStop} onClick={stopRecording}>
+                  Stop
+                </button>
+              </div>
 
-          <button
-            className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
-            onClick={analyzeNow}
-            disabled={uiLocked || !exam?.transcript}
-            title={!exam?.transcript ? "Brak transkrypcji" : "Wymusza ponowną analizę LLM"}
-          >
-            Wymuś analizę
-          </button>
-        </div>
+              {recordedUrl && (
+                <div className="space-y-2">
+                  <audio controls src={recordedUrl} className="w-full" />
+                  <div className="text-xs text-slate-500">
+                    MIME: <span className="font-mono">{recordedMime}</span> • Rozmiar: <span className="font-mono">{recordedBlob?.size ?? 0}</span> B
+                  </div>
+                </div>
+              )}
 
-        <div className="text-xs opacity-80">
-          <span className="font-semibold">Pipeline:</span> {pipelineLabel(pipelineStep)}
-          {pipelineMsg ? ` — ${pipelineMsg}` : ""}
-        </div>
-
-        {hasAnyAnalysis && (
-          <div className="rounded-lg border p-3 text-xs space-y-1">
-            <div className="font-semibold">Kompletność (LLM):</div>
-            <div className="flex flex-wrap gap-2">
-              <span className="rounded-full border px-2 py-0.5">Powód: {missing?.reason ? "❌" : "✅"}</span>
-              <span className="rounded-full border px-2 py-0.5">Opis: {missing?.findings ? "❌" : "✅"}</span>
-              <span className="rounded-full border px-2 py-0.5">Wnioski: {missing?.conclusions ? "❌" : "✅"}</span>
-              <span className="rounded-full border px-2 py-0.5">Zalecenia: {missing?.recommendations ? "❌" : "✅"}</span>
+              <div className="pt-1">
+                <button className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50" disabled={!canSave} onClick={saveRecordingLocal}>
+                  {savingAudio ? "Zapisuję…" : "Zapisz nagranie"}
+                </button>
+                <div className="mt-2 text-xs text-slate-500">Zapis lokalny jest wymagany do transkrypcji (localPath).</div>
+              </div>
             </div>
-          </div>
-        )}
 
-        <textarea
-          className="w-full rounded-lg border p-3 text-sm min-h-[240px]"
-          value={reportDraft}
-          onChange={(e) => {
-            setReportDraft(e.target.value);
-            reportDirtyRef.current = true;
-            setReportDirty(true);
-          }}
-          placeholder="Tu pojawi się raport. Możesz go edytować ręcznie."
-        />
-      </section>
+            {/* Local file (quiet section, no separate card) */}
+            {hasLocalRecording && (
+              <div className="space-y-2">
+                <div className="text-sm font-semibold">Plik nagrania</div>
+                <audio controls className="w-full" src={`/api/recordings/file?path=${encodeURIComponent(exam.recording!.localPath!)}`} />
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs">
+                  <div>
+                    Path: <span className="font-mono break-all">{exam.recording!.localPath}</span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Transcript */}
+            {(hasLocalRecording || hasTranscript) && (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-sm font-semibold">Transkrypcja</div>
+
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      className={`rounded-full border px-2 py-0.5 text-xs ${!showRaw ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-700 border-slate-200"}`}
+                      onClick={() => setShowRaw(false)}
+                      disabled={!exam.transcript}
+                    >
+                      Czyste
+                    </button>
+                    <button
+                      className={`rounded-full border px-2 py-0.5 text-xs ${showRaw ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-700 border-slate-200"}`}
+                      onClick={() => setShowRaw(true)}
+                      disabled={!exam.transcriptRaw}
+                    >
+                      Surowe
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap gap-2 items-center">
+                  <button
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+                    onClick={transcribeNow}
+                    disabled={uiLocked || !hasLocalRecording}
+                    title={!hasLocalRecording ? "Brak lokalnego nagrania" : ""}
+                  >
+                    {transcribing ? "Transkrybuję…" : "Transkrybuj"}
+                  </button>
+
+                  <button
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+                    onClick={analyzeNow}
+                    disabled={uiLocked || !exam?.transcript}
+                    title={!exam?.transcript ? "Brak transkrypcji" : ""}
+                  >
+                    Analizuj
+                  </button>
+
+                  <span className={`ml-auto rounded-full border px-2.5 py-1 text-xs ${pipelineTone}`}>Pipeline: {pipelineLabel(pipelineStep)}</span>
+                </div>
+
+                {transcriptToShow ? (
+                  <pre className="whitespace-pre-wrap rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs max-h-[280px] overflow-auto">
+                    {transcriptToShow}
+                  </pre>
+                ) : (
+                  <div className="text-sm text-slate-500">Brak transkrypcji — kliknij „Transkrybuj”.</div>
+                )}
+              </div>
+            )}
+          </section>
+        </div>
+
+        {/* Right: Report (dominant card) */}
+        <div className="lg:col-span-3">
+          <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-md space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <div className="text-sm font-semibold">Raport</div>
+                <div className="mt-1 text-xs text-slate-500">Edytuj ręcznie i zapisz do badania.</div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className={`rounded-full border px-2.5 py-1 text-xs ${pipelineTone}`}>{pipelineLabel(pipelineStep)}</span>
+
+                <button className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50" onClick={saveReport} disabled={uiLocked}>
+                  {savingReport ? "Zapisuję…" : "Zapisz"}
+                </button>
+
+                <button
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+                  onClick={generateReportNow}
+                  disabled={uiLocked}
+                  title="Generuj raport z aktualnej analizy"
+                >
+                  {generatingReport ? "Generuję…" : "Odśwież"}
+                </button>
+              </div>
+            </div>
+
+            <textarea
+              className="w-full rounded-xl border border-slate-200 bg-white p-3 text-sm min-h-[460px] focus:outline-none focus:ring-2 focus:ring-slate-200"
+              value={reportDraft}
+              onChange={(e) => {
+                setReportDraft(e.target.value);
+                reportDirtyRef.current = true;
+                setReportDirty(true);
+              }}
+              placeholder="Tu pojawi się raport. Możesz go edytować ręcznie."
+            />
+
+            <div className="text-xs text-slate-500 flex items-center justify-between">
+              <span>{reportDirty ? "Masz niezapisane zmiany." : "—"}</span>
+              <span className="font-mono">{reportDraft.length} znaków</span>
+            </div>
+          </section>
+        </div>
+      </div>
     </div>
   );
 }
