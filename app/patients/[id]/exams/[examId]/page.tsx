@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { useRouter, useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 
 import { doc, getDoc, serverTimestamp, updateDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase/client";
@@ -17,16 +17,17 @@ type ExamDoc = {
   createdAt?: any;
   updatedAt?: any;
   transcript?: string;
+  transcriptRaw?: string;
   report?: string;
   recording?: {
     storage: "local" | "firebase";
-    localPath?: string; // relativePath z API
-    absolutePath?: string; // tylko PoC (opcjonalnie)
+    localPath?: string;
+    absolutePath?: string;
     durationMs: number;
     mimeType: string;
     size: number;
     savedAt?: any;
-    expiresAt?: any; // pod retencję
+    expiresAt?: any;
   };
 };
 
@@ -38,14 +39,7 @@ function fmtMs(ms: number) {
 }
 
 function statusLabel(s: ExamStatus) {
-  switch (s) {
-    case "draft":
-      return "Szkic";
-    case "in_progress":
-      return "W trakcie";
-    case "done":
-      return "Zakończone";
-  }
+  return s === "draft" ? "Szkic" : s === "in_progress" ? "W trakcie" : "Zakończone";
 }
 
 function typeLabel(t?: string) {
@@ -58,56 +52,74 @@ function addDaysISO(days: number) {
   return d.toISOString();
 }
 
+// Bezpieczne czytanie odpowiedzi (JSON albo tekst)
+async function readJsonOrText(res: Response) {
+  const contentType = res.headers.get("content-type") || "";
+  const text = await res.text();
+
+  if (contentType.includes("application/json")) {
+    try {
+      return { kind: "json" as const, json: JSON.parse(text), text };
+    } catch {
+      return { kind: "text" as const, json: null, text };
+    }
+  }
+
+  return { kind: "text" as const, json: null, text };
+}
+
 export default function ExamPage() {
   const router = useRouter();
   const params = useParams<{ id: string; examId: string }>();
 
-  const patientIdRaw = params?.id;
-  const examIdRaw = params?.examId;
-
-  const patientId = Array.isArray(patientIdRaw) ? patientIdRaw[0] : patientIdRaw;
-  const examId = Array.isArray(examIdRaw) ? examIdRaw[0] : examIdRaw;
+  const patientId = Array.isArray(params?.id) ? params.id[0] : params?.id;
+  const examId = Array.isArray(params?.examId) ? params.examId[0] : params?.examId;
 
   const [loading, setLoading] = useState(true);
-  const [savingStatus, setSavingStatus] = useState(false);
+  const [savingAudio, setSavingAudio] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
 
   const [exam, setExam] = useState<ExamDoc | null>(null);
-  const [clinicId, setClinicId] = useState<string>("");
+  const [clinicId, setClinicId] = useState("");
 
-  // ---- MediaRecorder state ----
+  // MediaRecorder state
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
-  const startedAtRef = useRef<number>(0);
-  const elapsedBeforePauseRef = useRef<number>(0);
+  const startedAtRef = useRef(0);
+  const elapsedBeforePauseRef = useRef(0);
 
-  const [recState, setRecState] = useState<
-    "idle" | "recording" | "paused" | "stopped"
-  >("idle");
-  const [elapsedMs, setElapsedMs] = useState<number>(0);
+  const [recState, setRecState] = useState<"idle" | "recording" | "paused" | "stopped">("idle");
+  const [elapsedMs, setElapsedMs] = useState(0);
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
-  const [recordedUrl, setRecordedUrl] = useState<string>("");
-  const [recordedMime, setRecordedMime] = useState<string>("audio/webm");
+  const [recordedUrl, setRecordedUrl] = useState("");
+  const [recordedMime, setRecordedMime] = useState("audio/webm");
 
-  const [savingAudio, setSavingAudio] = useState(false);
-  const [err, setErr] = useState<string>("");
-  const [okMsg, setOkMsg] = useState<string>("");
+  const [err, setErr] = useState("");
+  const [okMsg, setOkMsg] = useState("");
+  const [showRaw, setShowRaw] = useState(false);
 
-  const canRecord = exam?.status === "in_progress";
+  // Raport
+  const [generatingReport, setGeneratingReport] = useState(false);
+  const [savingReport, setSavingReport] = useState(false);
+  const [reportDraft, setReportDraft] = useState("");
 
   const examRef = useMemo(() => {
     if (!patientId || !examId) return null;
     return doc(db, "patients", patientId, "exams", examId);
   }, [patientId, examId]);
 
+  const canRecord = exam?.status === "in_progress";
+  const hasLocalRecording = !!exam?.recording?.localPath;
+  const hasTranscript = !!exam?.transcript;
+  const transcriptToShow = showRaw ? exam?.transcriptRaw : exam?.transcript;
+
   // timer tick
   useEffect(() => {
     if (recState !== "recording") return;
 
     const t = window.setInterval(() => {
-      const now = Date.now();
-      const ms = elapsedBeforePauseRef.current + (now - startedAtRef.current);
-      setElapsedMs(ms);
+      setElapsedMs(elapsedBeforePauseRef.current + (Date.now() - startedAtRef.current));
     }, 250);
 
     return () => window.clearInterval(t);
@@ -135,76 +147,46 @@ export default function ExamPage() {
     mediaStreamRef.current = null;
   }
 
-  function pickSupportedMime(): string {
-    const candidates = [
-      "audio/webm;codecs=opus",
-      "audio/webm",
-      "audio/ogg;codecs=opus",
-      "audio/ogg",
-    ];
-    for (const c of candidates) {
-      // @ts-ignore
-      if (
-        typeof MediaRecorder !== "undefined" &&
-        MediaRecorder.isTypeSupported?.(c)
-      )
-        return c;
-    }
-    return "audio/webm";
-  }
-
   async function load() {
-    if (!examRef || !patientId || !examId) return;
-
+    if (!examRef) return;
     setLoading(true);
     setErr("");
     setOkMsg("");
+
     try {
-      const myClinicId = await getMyClinicId();
-      setClinicId(myClinicId);
+      const cid = await getMyClinicId();
+      setClinicId(cid);
 
       const snap = await getDoc(examRef);
-      if (!snap.exists()) {
-        setErr("Nie znaleziono badania.");
-        setExam(null);
-      } else {
-        const data = snap.data() as ExamDoc;
-        setExam(data);
-      }
+      const data = snap.exists() ? (snap.data() as ExamDoc) : null;
+
+      setExam(data);
+      setReportDraft(data?.report || "");
     } catch (e: any) {
-      setErr(e?.message ?? "Błąd ładowania badania.");
+      setErr(e?.message || "Błąd ładowania");
     } finally {
       setLoading(false);
     }
   }
 
   useEffect(() => {
-    if (!patientId || !examId) return;
-    load();
+    void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [patientId, examId, examRef]);
+  }, [examRef]);
 
-  async function setStatus(next: ExamStatus) {
-    if (!exam || !examRef) return;
-    setSavingStatus(true);
-    setErr("");
-    setOkMsg("");
-    try {
-      await updateDoc(examRef, {
-        status: next,
-        updatedAt: serverTimestamp(),
-      });
-      setExam({ ...exam, status: next });
-    } catch (e: any) {
-      setErr(e?.message ?? "Nie udało się zmienić statusu.");
-    } finally {
-      setSavingStatus(false);
+  function pickSupportedMime(): string {
+    const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/ogg"];
+    for (const c of candidates) {
+      // @ts-ignore
+      if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported?.(c)) return c;
     }
+    return "audio/webm";
   }
 
   async function startRecording() {
     setErr("");
     setOkMsg("");
+
     if (!canRecord) {
       setErr("Nagrywanie dostępne tylko w statusie: W trakcie.");
       return;
@@ -221,21 +203,20 @@ export default function ExamPage() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
-      const mimeType = pickSupportedMime();
-      setRecordedMime(mimeType);
+      const mime = pickSupportedMime();
+      setRecordedMime(mime);
 
-      const mr = new MediaRecorder(stream, { mimeType } as any);
+      const mr = new MediaRecorder(stream, { mimeType: mime } as any);
       mediaRecorderRef.current = mr;
 
-      mr.ondataavailable = (ev) => {
-        if (ev.data && ev.data.size > 0) chunksRef.current.push(ev.data);
+      mr.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
       };
 
       mr.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: mimeType });
+        const blob = new Blob(chunksRef.current, { type: mime });
         setRecordedBlob(blob);
-        const url = URL.createObjectURL(blob);
-        setRecordedUrl(url);
+        setRecordedUrl(URL.createObjectURL(blob));
         setRecState("stopped");
         tryStopTracks();
       };
@@ -257,14 +238,14 @@ export default function ExamPage() {
   async function pauseRecording() {
     setErr("");
     setOkMsg("");
+
     const mr = mediaRecorderRef.current;
     if (!mr) return;
 
     try {
       if (mr.state === "recording") {
         mr.pause();
-        const now = Date.now();
-        elapsedBeforePauseRef.current += now - startedAtRef.current;
+        elapsedBeforePauseRef.current += Date.now() - startedAtRef.current;
         setElapsedMs(elapsedBeforePauseRef.current);
         setRecState("paused");
       }
@@ -276,6 +257,7 @@ export default function ExamPage() {
   async function resumeRecording() {
     setErr("");
     setOkMsg("");
+
     const mr = mediaRecorderRef.current;
     if (!mr) return;
 
@@ -293,13 +275,13 @@ export default function ExamPage() {
   async function stopRecording() {
     setErr("");
     setOkMsg("");
+
     const mr = mediaRecorderRef.current;
     if (!mr) return;
 
     try {
-      const now = Date.now();
       if (recState === "recording") {
-        elapsedBeforePauseRef.current += now - startedAtRef.current;
+        elapsedBeforePauseRef.current += Date.now() - startedAtRef.current;
       }
       setElapsedMs(elapsedBeforePauseRef.current);
 
@@ -318,229 +300,258 @@ export default function ExamPage() {
       setErr("Brak nagrania do zapisania.");
       return;
     }
-    if (!patientId || !examId || !examRef) {
+    if (!examRef || !patientId || !examId) {
       setErr("Brak parametrów ścieżki (patientId/examId).");
+      return;
+    }
+    if (!clinicId) {
+      setErr("Brak clinicId (spróbuj odświeżyć stronę).");
       return;
     }
 
     setSavingAudio(true);
     try {
-      const cid = clinicId || exam?.clinicId || (await getMyClinicId());
-
       const form = new FormData();
       form.append("file", recordedBlob, "recording.webm");
-      form.append("clinicId", cid);
+      form.append("clinicId", clinicId);
       form.append("patientId", patientId);
       form.append("examId", examId);
       form.append("durationMs", String(elapsedMs));
 
-      const res = await fetch("/api/recordings", {
-        method: "POST",
-        body: form,
-      });
+      const res = await fetch("/api/recordings", { method: "POST", body: form });
+      const parsed = await readJsonOrText(res);
 
-      const json = await res.json();
+      const json = (parsed.kind === "json" ? parsed.json : null) as any;
 
       if (!res.ok || !json?.ok) {
-        throw new Error(json?.error || "Nie udało się zapisać nagrania lokalnie.");
+        throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`);
       }
-
-      // retencja 30 dni (metadane)
-      const expiresAtISO = addDaysISO(30);
 
       await updateDoc(examRef, {
         recording: {
           storage: "local",
           localPath: json.relativePath,
-          absolutePath: json.absolutePath, // PoC only (możesz usunąć później)
+          absolutePath: json.absolutePath,
           durationMs: elapsedMs,
           mimeType: recordedBlob.type || recordedMime,
           size: recordedBlob.size,
           savedAt: serverTimestamp(),
-          // w PoC trzymamy ISO do czytelności, docelowo można Timestamp
-          expiresAt: expiresAtISO,
+          expiresAt: addDaysISO(30),
         },
         updatedAt: serverTimestamp(),
+        status: "in_progress",
       });
 
-      setExam((prev) =>
-        prev
-          ? {
-              ...prev,
-              recording: {
-                storage: "local",
-                localPath: json.relativePath,
-                absolutePath: json.absolutePath,
-                durationMs: elapsedMs,
-                mimeType: recordedBlob.type || recordedMime,
-                size: recordedBlob.size,
-                savedAt: null,
-                expiresAt: expiresAtISO as any,
-              },
-            }
-          : prev
-      );
+      await load();
+      setErr("");
 
-      setOkMsg("✅ Nagranie zapisane lokalnie na dysku serwera i podpięte do badania.");
+      // reset po zapisie
+      setRecState("idle");
+      setElapsedMs(0);
+      setRecordedBlob(null);
+      if (recordedUrl) URL.revokeObjectURL(recordedUrl);
+      setRecordedUrl("");
+      chunksRef.current = [];
+      elapsedBeforePauseRef.current = 0;
+
+      setOkMsg("✅ Nagranie zapisane lokalnie i podpięte do badania.");
     } catch (e: any) {
-      setErr(e?.message ?? "Błąd zapisu nagrania lokalnie.");
+      setErr(e?.message || "Błąd zapisu");
+      setOkMsg("");
     } finally {
       setSavingAudio(false);
     }
   }
 
-  if (!patientId || !examId) {
-    return (
-      <div className="p-6 space-y-3">
-        <div className="text-lg font-semibold">Badanie</div>
-        <div className="text-sm opacity-70">Ładowanie parametrów routingu…</div>
-      </div>
-    );
+  async function transcribeNow() {
+    setErr("");
+    setOkMsg("");
+
+    if (!patientId || !examId) {
+      setErr("Brak patientId/examId.");
+      return;
+    }
+    if (!hasLocalRecording) {
+      setErr("Brak lokalnego nagrania do transkrypcji (localPath).");
+      return;
+    }
+
+    setTranscribing(true);
+    try {
+      const res = await fetch("/api/exams/transcribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ patientId, examId }),
+      });
+
+      const parsed = await readJsonOrText(res);
+      const json = (parsed.kind === "json" ? parsed.json : null) as any;
+
+      if (!res.ok || !json?.ok) {
+        throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`);
+      }
+
+      await load();
+      setErr("");
+      setOkMsg("✅ Transkrypcja gotowa");
+    } catch (e: any) {
+      setErr(e?.message || "Błąd transkrypcji");
+      setOkMsg("");
+    } finally {
+      setTranscribing(false);
+    }
   }
 
-  if (loading) {
-    return (
-      <div className="p-6">
-        <div className="text-sm opacity-70">Ładowanie badania…</div>
-      </div>
-    );
+  async function setInProgress() {
+    setErr("");
+    setOkMsg("");
+
+    if (!examRef) return;
+
+    try {
+      await updateDoc(examRef, {
+        status: "in_progress",
+        updatedAt: serverTimestamp(),
+      });
+      await load();
+      setOkMsg("✅ Status ustawiony na: W trakcie");
+    } catch (e: any) {
+      setErr(e?.message || "Nie udało się zmienić statusu badania.");
+    }
   }
 
-  if (!exam) {
-    return (
-      <div className="p-6 space-y-3">
-        <div className="text-lg font-semibold">Badanie</div>
-        {err && (
-          <div className="rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-700">
-            {err}
-          </div>
-        )}
-        <button
-          className="rounded-lg border px-3 py-2 text-sm"
-          onClick={() => router.push(`/patients/${patientId}`)}
-        >
-          Wróć do pacjenta
-        </button>
-      </div>
-    );
+  async function generateReportNow() {
+    setErr("");
+    setOkMsg("");
+
+    if (!patientId || !examId) {
+      setErr("Brak patientId/examId.");
+      return;
+    }
+    if (!exam?.transcript) {
+      setErr("Brak transkrypcji — najpierw wykonaj transkrypcję.");
+      return;
+    }
+
+    setGeneratingReport(true);
+    try {
+      const res = await fetch("/api/exams/generate-report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ patientId, examId }),
+      });
+
+      const parsed = await readJsonOrText(res);
+      const json = (parsed.kind === "json" ? parsed.json : null) as any;
+
+      if (!res.ok || !json?.ok) {
+        throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`);
+      }
+
+      await load();
+      setErr("");
+      setOkMsg("✅ Raport wygenerowany");
+    } catch (e: any) {
+      setErr(e?.message || "Błąd generowania raportu");
+      setOkMsg("");
+    } finally {
+      setGeneratingReport(false);
+    }
   }
+
+  async function saveReport() {
+    setErr("");
+    setOkMsg("");
+
+    if (!examRef) {
+      setErr("Brak referencji do badania.");
+      return;
+    }
+
+    setSavingReport(true);
+    try {
+      await updateDoc(examRef, {
+        report: reportDraft,
+        updatedAt: serverTimestamp(),
+      });
+      await load();
+      setErr("");
+      setOkMsg("✅ Raport zapisany");
+    } catch (e: any) {
+      setErr(e?.message || "Błąd zapisu raportu");
+      setOkMsg("");
+    } finally {
+      setSavingReport(false);
+    }
+  }
+
+  if (loading) return <div className="p-6">Ładowanie…</div>;
+  if (!exam) return <div className="p-6">Brak badania</div>;
+
+  const uiLocked = savingAudio || transcribing || generatingReport || savingReport;
+
+  const canStart = canRecord && !uiLocked && recState === "idle";
+  const canPause = canRecord && !uiLocked && recState === "recording";
+  const canResume = canRecord && !uiLocked && recState === "paused";
+  const canStop = canRecord && !uiLocked && (recState === "recording" || recState === "paused");
+  const canSave = !!recordedBlob && !uiLocked;
 
   return (
     <div className="p-6 space-y-6">
+      {err && <div className="rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-700">{err}</div>}
+      {okMsg && <div className="rounded-lg border border-green-300 bg-green-50 p-3 text-sm text-green-800">{okMsg}</div>}
+
       <div className="flex items-start justify-between gap-4">
         <div>
           <div className="text-xl font-semibold">{typeLabel(exam.type)}</div>
           <div className="mt-1 text-sm opacity-70">
-            Patient: <span className="font-mono">{patientId}</span> • Exam:{" "}
-            <span className="font-mono">{examId}</span>
+            Patient: <span className="font-mono">{patientId}</span> • Exam: <span className="font-mono">{examId}</span>
           </div>
         </div>
 
         <div className="flex items-center gap-2">
-          <span className="rounded-full border px-3 py-1 text-xs">
-            {statusLabel(exam.status)}
-          </span>
-          <button
-            className="rounded-lg border px-3 py-2 text-sm"
-            onClick={() => router.push(`/patients/${patientId}`)}
-          >
+          <span className="rounded-full border px-3 py-1 text-xs">{statusLabel(exam.status)}</span>
+
+          {exam.status !== "in_progress" && (
+            <button className="rounded-lg border px-3 py-2 text-sm" onClick={setInProgress} title="Odblokowuje nagrywanie">
+              Ustaw: W trakcie
+            </button>
+          )}
+
+          <button className="rounded-lg border px-3 py-2 text-sm" onClick={() => router.push(`/patients/${patientId}`)}>
             Wróć do pacjenta
           </button>
         </div>
       </div>
 
-      {err && (
-        <div className="rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-700">
-          {err}
-        </div>
-      )}
-      {okMsg && (
-        <div className="rounded-lg border border-green-300 bg-green-50 p-3 text-sm text-green-800">
-          {okMsg}
-        </div>
-      )}
-
-      <section className="rounded-2xl border p-4 space-y-3">
-        <div className="text-sm font-semibold">Status badania</div>
-        <div className="flex flex-wrap gap-2">
-          <button
-            disabled={savingStatus || exam.status === "draft"}
-            className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
-            onClick={() => setStatus("draft")}
-          >
-            Ustaw: szkic
-          </button>
-          <button
-            disabled={savingStatus || exam.status === "in_progress"}
-            className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
-            onClick={() => setStatus("in_progress")}
-          >
-            Ustaw: w trakcie
-          </button>
-          <button
-            disabled={savingStatus || exam.status === "done"}
-            className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
-            onClick={() => setStatus("done")}
-          >
-            Ustaw: zakończone
-          </button>
-        </div>
-        <div className="text-xs opacity-70">
-          Nagrywanie jest aktywne tylko gdy status = <b>W trakcie</b>.
-        </div>
-      </section>
-
+      {/* NAGRYWANIE */}
       <section className="rounded-2xl border p-4 space-y-4">
         <div className="flex items-center justify-between gap-3">
           <div className="text-sm font-semibold">Nagrywanie</div>
           <div className="text-sm font-mono">{fmtMs(elapsedMs)}</div>
         </div>
 
+        {!canRecord && (
+          <div className="text-xs opacity-70">
+            Nagrywanie dostępne tylko dla statusu: <b>W trakcie</b>.
+          </div>
+        )}
+
         <div className="flex flex-wrap gap-2 items-center">
-          <button
-            className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
-            disabled={!canRecord || recState === "recording" || savingAudio}
-            onClick={startRecording}
-          >
+          <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" disabled={!canStart} onClick={startRecording}>
             Start
           </button>
 
-          {recState === "recording" ? (
-            <button
-              className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
-              disabled={!canRecord || savingAudio}
-              onClick={pauseRecording}
-            >
-              Pauza
-            </button>
-          ) : (
-            <button
-              className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
-              disabled={!canRecord || recState !== "paused" || savingAudio}
-              onClick={resumeRecording}
-            >
-              Wznów
-            </button>
-          )}
-
-          <button
-            className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
-            disabled={
-              !canRecord ||
-              (recState !== "recording" && recState !== "paused") ||
-              savingAudio
-            }
-            onClick={stopRecording}
-          >
-            Stop
+          <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" disabled={!canPause} onClick={pauseRecording}>
+            Pauza
           </button>
 
-          <button
-            className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
-            disabled={!recordedBlob || savingAudio}
-            onClick={saveRecordingLocal}
-          >
-            {savingAudio ? "Zapisuję lokalnie…" : "Zapisz nagranie (lokalnie)"}
+          <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" disabled={!canResume} onClick={resumeRecording}>
+            Wznów
+          </button>
+
+          <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" disabled={!canStop} onClick={stopRecording}>
+            Stop
           </button>
         </div>
 
@@ -555,37 +566,89 @@ export default function ExamPage() {
           </div>
         )}
 
-        {exam.recording?.storage === "local" && exam.recording?.localPath && (
-         <div className="space-y-3">
-           <div className="text-xs opacity-70">Nagranie zapisane lokalnie:</div>
-
-           <audio
-             controls
-             className="w-full"
-             src={`/api/recordings/file?path=${encodeURIComponent(
-               exam.recording.localPath
-             )}`}
-           />
-
-           <div className="rounded-lg border p-3 text-xs space-y-1">
-             <div>
-               Path:{" "}
-               <span className="font-mono break-all">
-                {exam.recording.localPath}
-               </span>
-              </div>
-              {exam.recording.expiresAt && (
-                <div>
-                 Retencja do:{" "}
-                <span className="font-mono">
-                 {String(exam.recording.expiresAt)}
-                </span>
-               </div>
-           )}
-         </div>
+        <div className="pt-2">
+          <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" disabled={!canSave} onClick={saveRecordingLocal}>
+            {savingAudio ? "Zapisuję lokalnie…" : "Zapisz nagranie (lokalnie)"}
+          </button>
         </div>
-        )}
+      </section>
 
+      {/* NAGRANIE LOKALNE */}
+      {hasLocalRecording && (
+        <section className="rounded-2xl border p-4 space-y-4">
+          <div className="text-sm font-semibold">Nagranie zapisane lokalnie</div>
+
+          <audio controls className="w-full" src={`/api/recordings/file?path=${encodeURIComponent(exam.recording!.localPath!)}`} />
+
+          <div className="rounded-lg border p-3 text-xs space-y-1">
+            <div>
+              Path: <span className="font-mono break-all">{exam.recording!.localPath}</span>
+            </div>
+            {exam.recording?.expiresAt && (
+              <div>
+                Retencja do: <span className="font-mono">{String(exam.recording.expiresAt)}</span>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
+      {/* TRANSKRYPCJA */}
+      {(hasLocalRecording || hasTranscript) && (
+        <section className="rounded-2xl border p-4 space-y-4">
+          <div className="text-sm font-semibold">Transkrypcja</div>
+
+          <div className="flex items-center gap-2">
+            <button className="rounded-lg border px-3 py-1 text-xs disabled:opacity-50" onClick={() => setShowRaw(false)} disabled={!exam.transcript}>
+              Czyste
+            </button>
+
+            <button className="rounded-lg border px-3 py-1 text-xs disabled:opacity-50" onClick={() => setShowRaw(true)} disabled={!exam.transcriptRaw}>
+              Surowe
+            </button>
+          </div>
+
+          {hasLocalRecording && (
+            <div className="flex flex-wrap gap-2 items-center">
+              <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" onClick={transcribeNow} disabled={uiLocked}>
+                {transcribing ? "Transkrybuję…" : "Transkrybuj"}
+              </button>
+            </div>
+          )}
+
+          {transcriptToShow ? (
+            <pre className="whitespace-pre-wrap rounded-lg border p-3 text-xs">{transcriptToShow}</pre>
+          ) : (
+            <div className="text-sm opacity-70">Brak transkrypcji — kliknij „Transkrybuj”.</div>
+          )}
+        </section>
+      )}
+
+      {/* RAPORT (zawsze widoczny) */}
+      <section className="rounded-2xl border p-4 space-y-4">
+        <div className="text-sm font-semibold">Raport</div>
+
+        <div className="flex flex-wrap gap-2 items-center">
+          <button
+            className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
+            onClick={generateReportNow}
+            disabled={uiLocked || !exam?.transcript}
+            title={!exam?.transcript ? "Najpierw wykonaj transkrypcję" : ""}
+          >
+            {generatingReport ? "Generuję…" : "Generuj raport"}
+          </button>
+
+          <button className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50" onClick={saveReport} disabled={uiLocked}>
+            {savingReport ? "Zapisuję…" : "Zapisz"}
+          </button>
+        </div>
+
+        <textarea
+          className="w-full rounded-lg border p-3 text-sm min-h-[240px]"
+          value={reportDraft}
+          onChange={(e) => setReportDraft(e.target.value)}
+          placeholder="Tu pojawi się raport. Możesz go edytować ręcznie."
+        />
       </section>
     </div>
   );
