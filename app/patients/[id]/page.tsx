@@ -3,15 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import {
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  orderBy,
-  query,
-  Timestamp,
-} from "firebase/firestore";
+import { collection, doc, getDoc, getDocs, orderBy, query, Timestamp } from "firebase/firestore";
 import { db } from "@/lib/firebase/client";
 import { getMyClinicId } from "@/lib/firebase/user";
 
@@ -38,41 +30,19 @@ function statusLabel(status?: string) {
   return "szkic";
 }
 
-function statusChipStyle(status?: string): React.CSSProperties {
+function statusBadgeClass(status?: string) {
   const s = (status || "draft").toLowerCase();
-  const base: React.CSSProperties = {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 6,
-    padding: "4px 8px",
-    borderRadius: 999,
-    fontSize: 12,
-    fontWeight: 800,
-    border: "1px solid rgba(255,255,255,0.18)",
-    background: "rgba(255,255,255,0.06)",
-    opacity: 0.95,
-    whiteSpace: "nowrap",
-  };
+
+  const base =
+    "inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-semibold whitespace-nowrap";
 
   if (s === "in_progress") {
-    return {
-      ...base,
-      border: "1px solid rgba(255,255,255,0.32)",
-      background: "rgba(255,255,255,0.10)",
-    };
+    return `${base} border-amber-200 bg-amber-50 text-amber-800`;
   }
-
   if (s === "done") {
-    return {
-      ...base,
-      border: "1px solid rgba(255,255,255,0.28)",
-      background: "rgba(255,255,255,0.08)",
-      opacity: 0.9,
-    };
+    return `${base} border-green-200 bg-green-50 text-green-800`;
   }
-
-  // draft
-  return base;
+  return `${base} border-slate-200 bg-slate-50 text-slate-700`;
 }
 
 export default function PatientDetailsPage() {
@@ -137,11 +107,7 @@ export default function PatientDetailsPage() {
         });
 
         // 2) Badania
-        const examsQ = query(
-          collection(db, "patients", patientId, "exams"),
-          orderBy("createdAt", "desc")
-        );
-
+        const examsQ = query(collection(db, "patients", patientId, "exams"), orderBy("createdAt", "desc"));
         const examsSnap = await getDocs(examsQ);
         if (cancelled) return;
 
@@ -175,137 +141,121 @@ export default function PatientDetailsPage() {
   const examNewHref = patientId ? `/patients/${patientId}/exams/new` : "/patients";
 
   return (
-    <div style={{ padding: 24, fontFamily: "system-ui", maxWidth: 720 }}>
-      <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-        <h1 style={{ margin: 0 }}>Karta pacjenta</h1>
-        <Link href="/patients">← Wróć</Link>
+    <div className="space-y-5">
+      {/* Header */}
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <Link href="/patients" className="text-sm text-slate-600 hover:text-slate-900">
+            ← Wróć
+          </Link>
+          <div className="text-lg font-semibold tracking-tight">Karta pacjenta</div>
+        </div>
+
+        <Link
+          href={examNewHref}
+          className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+        >
+          Rozpocznij badanie
+        </Link>
       </div>
 
-      {loading && <p>Ładowanie...</p>}
-      {error && !loading && <p style={{ color: "tomato" }}>Błąd: {error}</p>}
+      {/* Alerts */}
+      {loading && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-700 shadow-sm">Ładowanie…</div>
+      )}
+      {error && !loading && (
+        <div className="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm text-red-800 shadow-sm">
+          <div className="font-semibold">Błąd</div>
+          <div className="mt-1">{error}</div>
+        </div>
+      )}
 
       {!loading && !error && patient && (
-        <div style={{ marginTop: 16, display: "grid", gap: 12 }}>
-          {/* Dane pacjenta */}
-          <div
-            style={{
-              padding: 12,
-              borderRadius: 12,
-              border: "1px solid rgba(255,255,255,0.18)",
-              background: "rgba(255,255,255,0.06)",
-            }}
-          >
-            <div style={{ fontSize: 18, fontWeight: 800 }}>
-              {patient.name?.trim() || "Bez imienia"}
-            </div>
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
+          {/* Patient card */}
+          <section className="lg:col-span-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+            <div className="text-sm font-semibold text-slate-900">Pacjent</div>
 
-            <div style={{ marginTop: 6, opacity: 0.85 }}>
-              {(patient.species?.trim() || "nieznany gatunek") +
-                (patient.breed?.toString().trim()
-                  ? ` • ${patient.breed.toString().trim()}`
-                  : "")}
-            </div>
+            <div className="mt-3">
+              <div className="text-xl font-semibold tracking-tight">{patient.name?.trim() || "Bez imienia"}</div>
 
-            {patient.ownerName?.toString().trim() ? (
-              <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
-                Właściciel: {patient.ownerName.toString().trim()}
+              <div className="mt-1 text-sm text-slate-600">
+                {(patient.species?.trim() || "nieznany gatunek") +
+                  (patient.breed?.toString().trim() ? ` • ${patient.breed.toString().trim()}` : "")}
               </div>
-            ) : null}
 
-            <div style={{ marginTop: 10, fontSize: 12, opacity: 0.6 }}>
-              ID: {patient.id}
+              {patient.ownerName?.toString().trim() ? (
+                <div className="mt-3 text-sm text-slate-600">
+                  <span className="text-slate-500">Właściciel:</span> {patient.ownerName.toString().trim()}
+                </div>
+              ) : null}
+
+              <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
+                <div className="text-slate-500">ID</div>
+                <div className="mt-1 font-mono break-all">{patient.id}</div>
+              </div>
             </div>
-          </div>
+          </section>
 
-          {/* Badania */}
-          <div
-            style={{
-              padding: 12,
-              borderRadius: 12,
-              border: "1px solid rgba(255,255,255,0.18)",
-              background: "rgba(255,255,255,0.06)",
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: 12,
-              }}
-            >
-              <h2 style={{ margin: 0, fontSize: 16 }}>Badania</h2>
-
-              <Link
-                href={examNewHref}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid rgba(255,255,255,0.22)",
-                  background: "rgba(255,255,255,0.10)",
-                  textDecoration: "none",
-                  color: "inherit",
-                  whiteSpace: "nowrap",
-                }}
-              >
-                ➕ Rozpocznij badanie
-              </Link>
+          {/* Exams */}
+          <section className="lg:col-span-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold text-slate-900">Badania</div>
+                <div className="mt-1 text-xs text-slate-500">Kliknij badanie, aby wejść do nagrania i raportu.</div>
+              </div>
             </div>
 
-            {examsLoading && <p style={{ marginTop: 12 }}>Ładowanie badań...</p>}
+            {examsLoading && <div className="mt-4 text-sm text-slate-600">Ładowanie badań…</div>}
             {examsError && !examsLoading && (
-              <p style={{ marginTop: 12, color: "tomato" }}>Błąd: {examsError}</p>
+              <div className="mt-4 rounded-2xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                <div className="font-semibold">Błąd</div>
+                <div className="mt-1">{examsError}</div>
+              </div>
             )}
 
             {!examsLoading && !examsError && exams.length === 0 && (
-              <div style={{ marginTop: 12, opacity: 0.85 }}>
-                <div style={{ fontWeight: 700 }}>Brak badań</div>
-                <div style={{ marginTop: 4, fontSize: 13, opacity: 0.8 }}>
+              <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                <div className="font-semibold text-slate-900">Brak badań</div>
+                <div className="mt-1 text-sm text-slate-600">
                   Utwórz pierwsze badanie, aby rozpocząć dokumentowanie wizyty.
                 </div>
               </div>
             )}
 
             {!examsLoading && !examsError && exams.length > 0 && (
-              <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+              <div className="mt-4 grid gap-2">
                 {exams.map((ex) => (
                   <Link
                     key={ex.id}
                     href={`/patients/${patientId}/exams/${ex.id}`}
-                    style={{
-                      display: "block",
-                      padding: 10,
-                      borderRadius: 10,
-                      border: "1px solid rgba(255,255,255,0.16)",
-                      background: "rgba(255,255,255,0.05)",
-                      textDecoration: "none",
-                      color: "inherit",
-                    }}
+                    className={[
+                      "group block rounded-2xl border border-slate-200 bg-white p-4",
+                      "hover:bg-slate-50 hover:border-slate-300",
+                      "focus:outline-none focus:ring-2 focus:ring-slate-200",
+                      "transition",
+                    ].join(" ")}
                   >
-                    <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                      <div style={{ display: "grid", gap: 6 }}>
-                        <div style={{ fontWeight: 900 }}>
-                          {(ex.type || "Badanie").toString()}
-                        </div>
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="min-w-0">
+                        <div className="text-base font-semibold text-slate-900">{(ex.type || "Badanie").toString()}</div>
 
-                        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                          <span style={statusChipStyle(ex.status)}>
-                            {statusLabel(ex.status)}
-                          </span>
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          <span className={statusBadgeClass(ex.status)}>{statusLabel(ex.status)}</span>
 
-                          <span style={{ fontSize: 12, opacity: 0.75 }}>
+                          <span className="text-xs text-slate-500">
                             {ex.createdAt ? ex.createdAt.toDate().toLocaleString() : ""}
                           </span>
                         </div>
                       </div>
 
-                      <div style={{ opacity: 0.6, whiteSpace: "nowrap" }}>→</div>
+                      <div className="text-slate-400 group-hover:text-slate-600 transition">→</div>
                     </div>
                   </Link>
                 ))}
               </div>
             )}
-          </div>
+          </section>
         </div>
       )}
     </div>

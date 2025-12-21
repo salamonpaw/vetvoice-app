@@ -46,65 +46,90 @@ export default function PatientsPage() {
   }, []);
 
   return (
-    <div style={{ padding: 24, fontFamily: "system-ui", maxWidth: 780 }}>
-      <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-        <h1 style={{ margin: 0 }}>Pacjenci</h1>
-        <Link href="/patients/new">➕ Dodaj pacjenta</Link>
+    <div className="space-y-5">
+      {/* Header */}
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-lg font-semibold tracking-tight">Pacjenci</div>
+
+        <Link
+          href="/patients/new"
+          className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+        >
+          Dodaj pacjenta
+        </Link>
       </div>
 
-      <p style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
-        user.ts version: {USER_TS_VERSION}
-      </p>
+      <div className="text-xs text-slate-500">user.ts version: {USER_TS_VERSION}</div>
 
-      {loading && <p>Ładowanie...</p>}
-      {error && <p style={{ color: "tomato" }}>Błąd: {error}</p>}
-
-      {!loading && !error && patients.length === 0 && (
-        <p>Brak pacjentów w tej klinice.</p>
+      {/* Loading / Error */}
+      {loading && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-700 shadow-sm">
+          Ładowanie…
+        </div>
       )}
 
+      {error && !loading && (
+        <div className="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm text-red-800 shadow-sm">
+          <div className="font-semibold">Błąd</div>
+          <div className="mt-1 whitespace-pre-wrap">{error}</div>
+        </div>
+      )}
+
+      {/* Empty */}
+      {!loading && !error && patients.length === 0 && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="text-sm font-semibold text-slate-900">Brak pacjentów</div>
+          <div className="mt-1 text-sm text-slate-600">Dodaj pierwszego pacjenta, aby rozpocząć pracę.</div>
+        </div>
+      )}
+
+      {/* List */}
       {!loading && !error && patients.length > 0 && (
-        <div style={{ marginTop: 14, display: "grid", gap: 10 }}>
-          {patients.map((p) => {
-            const name = (p.name || "").trim() || "Bez imienia";
-            const species = (p.species || "").trim() || "nieznany gatunek";
-            const breed = (p.breed || "").toString().trim();
-            const ownerName = (p.ownerName || "").toString().trim();
+        <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="text-sm font-semibold text-slate-900">Lista pacjentów</div>
+          <div className="mt-1 text-xs text-slate-500">Kliknij pacjenta, aby przejść do karty i badań.</div>
 
-            return (
-              <Link
-                key={p.id}
-                href={`/patients/${p.id}`}
-                style={{
-                  display: "block",
-                  padding: 12,
-                  borderRadius: 12,
-                  border: "1px solid rgba(255,255,255,0.18)",
-                  textDecoration: "none",
-                  color: "inherit",
-                  background: "rgba(255,255,255,0.06)",
-                }}
-              >
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                  <div style={{ display: "grid", gap: 4 }}>
-                    <div style={{ fontSize: 16, fontWeight: 700 }}>{name}</div>
+          <div className="mt-4 grid gap-2">
+            {patients.map((p) => {
+              const name = (p.name || "").trim() || "Bez imienia";
+              const species = (p.species || "").trim() || "nieznany gatunek";
+              const breed = (p.breed || "").toString().trim();
+              const ownerName = (p.ownerName || "").toString().trim();
 
-                    <div style={{ opacity: 0.85 }}>
-                      {species}
-                      {breed ? ` • ${breed}` : ""}
+              return (
+                <Link
+                  key={p.id}
+                  href={`/patients/${p.id}`}
+                  className={[
+                    "group block rounded-2xl border border-slate-200 bg-white p-4",
+                    "hover:bg-slate-50 hover:border-slate-300",
+                    "focus:outline-none focus:ring-2 focus:ring-slate-200",
+                    "transition",
+                  ].join(" ")}
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="text-base font-semibold text-slate-900">{name}</div>
+
+                      <div className="mt-1 text-sm text-slate-600">
+                        {species}
+                        {breed ? ` • ${breed}` : ""}
+                      </div>
+
+                      {ownerName ? (
+                        <div className="mt-2 text-sm text-slate-600">
+                          <span className="text-slate-500">Właściciel:</span> {ownerName}
+                        </div>
+                      ) : null}
                     </div>
 
-                    {ownerName ? (
-                      <div style={{ fontSize: 12, opacity: 0.75 }}>Właściciel: {ownerName}</div>
-                    ) : null}
+                    <div className="text-slate-400 group-hover:text-slate-600 transition">→</div>
                   </div>
-
-                  <div style={{ opacity: 0.6, whiteSpace: "nowrap" }}>→</div>
-                </div>
-              </Link>
-            );
-          })}
-        </div>
+                </Link>
+              );
+            })}
+          </div>
+        </section>
       )}
     </div>
   );
