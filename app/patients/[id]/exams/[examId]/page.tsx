@@ -164,6 +164,11 @@ export default function ExamPage() {
   // IMPORTANT: ref do natychmiastowego “dirty” (eliminuje race: setState vs load())
   const reportDirtyRef = useRef(false);
 
+  // Import nagrania
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [importRunPipeline, setImportRunPipeline] = useState(false);
+
   const examRef = useMemo(() => {
     if (!patientIdFromParams || !examId) return null;
     return doc(db, "patients", patientIdFromParams, "exams", examId);
@@ -456,6 +461,77 @@ export default function ExamPage() {
     }
   }
 
+  async function importRecordingFile() {
+    setErr("");
+    setOkMsg("");
+
+    if (!importFile) {
+      setErr("Wybierz plik audio do importu.");
+      return;
+    }
+    if (!examRef || !patientIdFromParams || !examId) {
+      setErr("Brak parametrów ścieżki (patientId/examId).");
+      return;
+    }
+    if (!clinicId) {
+      setErr("Brak clinicId (spróbuj odświeżyć stronę).");
+      return;
+    }
+
+    // blokujemy w trakcie innych akcji
+    if (importing || savingAudio || transcribing || generatingReport || savingReport) return;
+
+    setImporting(true);
+    try {
+      await ensureInProgressBeforeRecording();
+
+      const form = new FormData();
+      form.append("file", importFile, importFile.name || "import-audio");
+      form.append("clinicId", clinicId);
+      form.append("patientId", patientIdFromParams);
+      form.append("examId", examId);
+      // nie znamy durationMs przy imporcie bez dekodowania audio — zostawiamy 0
+      form.append("durationMs", "0");
+
+      const res = await fetch("/api/recordings", { method: "POST", body: form });
+      const parsed = await readJsonOrText(res);
+      const json = (parsed.kind === "json" ? parsed.json : null) as any;
+
+      if (!res.ok || !json?.ok) {
+        throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 800)}`);
+      }
+
+      await updateDoc(examRef, {
+        recording: {
+          storage: "local",
+          localPath: json.relativePath,
+          absolutePath: json.absolutePath,
+          durationMs: 0,
+          mimeType: importFile.type || json.mimeType || "application/octet-stream",
+          size: importFile.size,
+          savedAt: serverTimestamp(),
+          expiresAt: addDaysISO(30),
+        },
+        updatedAt: serverTimestamp(),
+        status: "in_progress",
+      });
+
+      setImportFile(null);
+
+      await load();
+      setOkMsg("✅ Nagranie zaimportowane.");
+
+      if (importRunPipeline) {
+        await runAutoReportPipeline();
+      }
+    } catch (e: any) {
+      setErr(e?.message || "Błąd importu nagrania");
+      setOkMsg("");
+    } finally {
+      setImporting(false);
+    }
+  }
+
   async function transcribeNow() {
     setErr("");
     setOkMsg("");
@@ -681,6 +757,7 @@ export default function ExamPage() {
     transcribing ||
     generatingReport ||
     savingReport ||
+    importing ||
     (pipelineStep !== "idle" && pipelineStep !== "done" && pipelineStep !== "error");
 
   const canStart = !uiLocked && recState === "idle";
@@ -707,7 +784,13 @@ export default function ExamPage() {
   const reportBlocked = !stepAnalysisDone;
 
   const pipelineTone =
-    pipelineStep === "error" ? tone("bad") : pipelineStep === "done" ? tone("ok") : pipelineStep === "idle" ? tone("neutral") : tone("warn");
+    pipelineStep === "error"
+      ? tone("bad")
+      : pipelineStep === "done"
+      ? tone("ok")
+      : pipelineStep === "idle"
+      ? tone("neutral")
+      : tone("warn");
 
   return (
     <div className="space-y-5">
@@ -718,6 +801,7 @@ export default function ExamPage() {
             <div className="rounded-2xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">
               <div className="font-semibold">Błąd</div>
               <div className="mt-1 whitespace-pre-wrap">{err}</div>
+              {pipelineMsg ? <div className="mt-2 text-xs text-red-700">Pipeline: {pipelineMsg}</div> : null}
             </div>
           )}
           {okMsg && (
@@ -793,9 +877,11 @@ export default function ExamPage() {
                 className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
                 onClick={runAutoReportPipeline}
                 disabled={uiLocked || (!hasLocalRecording && !exam?.transcript && !exam?.analysis?.sections)}
-                title={!hasLocalRecording && !exam?.transcript && !exam?.analysis?.sections ? "Najpierw nagraj i zapisz nagranie" : ""}
+                title={!hasLocalRecording && !exam?.transcript && !exam?.analysis?.sections ? "Najpierw dodaj nagranie" : ""}
               >
-                {pipelineStep !== "idle" && pipelineStep !== "done" && pipelineStep !== "error" ? pipelineLabel(pipelineStep) : "Generuj raport"}
+                {pipelineStep !== "idle" && pipelineStep !== "done" && pipelineStep !== "error"
+                  ? pipelineLabel(pipelineStep)
+                  : "Generuj raport"}
               </button>
             </div>
 
@@ -807,19 +893,35 @@ export default function ExamPage() {
               </div>
 
               <div className="flex flex-wrap gap-2 items-center">
-                <button className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50" disabled={!canStart} onClick={startRecording}>
+                <button
+                  className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
+                  disabled={!canStart}
+                  onClick={startRecording}
+                >
                   Start
                 </button>
 
-                <button className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50" disabled={!canPause} onClick={pauseRecording}>
+                <button
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+                  disabled={!canPause}
+                  onClick={pauseRecording}
+                >
                   Pauza
                 </button>
 
-                <button className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50" disabled={!canResume} onClick={resumeRecording}>
+                <button
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+                  disabled={!canResume}
+                  onClick={resumeRecording}
+                >
                   Wznów
                 </button>
 
-                <button className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50" disabled={!canStop} onClick={stopRecording}>
+                <button
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+                  disabled={!canStop}
+                  onClick={stopRecording}
+                >
                   Stop
                 </button>
               </div>
@@ -828,24 +930,82 @@ export default function ExamPage() {
                 <div className="space-y-2">
                   <audio controls src={recordedUrl} className="w-full" />
                   <div className="text-xs text-slate-500">
-                    MIME: <span className="font-mono">{recordedMime}</span> • Rozmiar: <span className="font-mono">{recordedBlob?.size ?? 0}</span> B
+                    MIME: <span className="font-mono">{recordedMime}</span> • Rozmiar:{" "}
+                    <span className="font-mono">{recordedBlob?.size ?? 0}</span> B
                   </div>
                 </div>
               )}
 
               <div className="pt-1">
-                <button className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50" disabled={!canSave} onClick={saveRecordingLocal}>
+                <button
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+                  disabled={!canSave}
+                  onClick={saveRecordingLocal}
+                >
                   {savingAudio ? "Zapisuję…" : "Zapisz nagranie"}
                 </button>
                 <div className="mt-2 text-xs text-slate-500">Zapis lokalny jest wymagany do transkrypcji (localPath).</div>
               </div>
             </div>
 
-            {/* Local file (quiet section, no separate card) */}
+            {/* Import */}
+            <div className="space-y-3">
+              <div className="text-sm font-semibold">Import nagrania</div>
+              <div className="text-xs text-slate-500">
+                Wgraj gotowy plik audio (mp3, m4a, wav, ogg, webm). Zostanie zapisany lokalnie i podpięty do badania.
+              </div>
+
+              <div className="grid gap-2">
+                <input
+                  type="file"
+                  accept="audio/*"
+                  disabled={uiLocked}
+                  onChange={(e) => {
+                    const f = e.target.files?.[0] || null;
+                    setImportFile(f);
+                  }}
+                  className="block w-full text-sm file:mr-3 file:rounded-xl file:border file:border-slate-200 file:bg-white file:px-3 file:py-2 file:text-sm file:hover:bg-slate-50"
+                />
+
+                <label className="flex items-center gap-2 text-sm text-slate-700 select-none">
+                  <input
+                    type="checkbox"
+                    checked={importRunPipeline}
+                    onChange={(e) => setImportRunPipeline(e.target.checked)}
+                    disabled={uiLocked}
+                  />
+                  Po imporcie uruchom pipeline (transkrypcja → analiza → raport)
+                </label>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+                    disabled={uiLocked || !importFile}
+                    onClick={importRecordingFile}
+                  >
+                    {importing ? "Importuję…" : "Wgraj do badania"}
+                  </button>
+
+                  {importFile ? (
+                    <div className="text-xs text-slate-500 truncate">
+                      Wybrano: <span className="font-mono">{importFile.name}</span> • {Math.round(importFile.size / 1024)} KB
+                    </div>
+                  ) : (
+                    <div className="text-xs text-slate-500">Nie wybrano pliku</div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Local file */}
             {hasLocalRecording && (
               <div className="space-y-2">
                 <div className="text-sm font-semibold">Plik nagrania</div>
-                <audio controls className="w-full" src={`/api/recordings/file?path=${encodeURIComponent(exam.recording!.localPath!)}`} />
+                <audio
+                  controls
+                  className="w-full"
+                  src={`/api/recordings/file?path=${encodeURIComponent(exam.recording!.localPath!)}`}
+                />
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs">
                   <div>
                     Path: <span className="font-mono break-all">{exam.recording!.localPath}</span>
@@ -862,16 +1022,22 @@ export default function ExamPage() {
 
                   <div className="flex items-center gap-1.5">
                     <button
-                      className={`rounded-full border px-2 py-0.5 text-xs ${!showRaw ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-700 border-slate-200"}`}
+                      className={`rounded-full border px-2 py-0.5 text-xs ${
+                        !showRaw ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-700 border-slate-200"
+                      }`}
                       onClick={() => setShowRaw(false)}
                       disabled={!exam.transcript}
+                      type="button"
                     >
                       Czyste
                     </button>
                     <button
-                      className={`rounded-full border px-2 py-0.5 text-xs ${showRaw ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-700 border-slate-200"}`}
+                      className={`rounded-full border px-2 py-0.5 text-xs ${
+                        showRaw ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-700 border-slate-200"
+                      }`}
                       onClick={() => setShowRaw(true)}
                       disabled={!exam.transcriptRaw}
+                      type="button"
                     >
                       Surowe
                     </button>
@@ -897,7 +1063,9 @@ export default function ExamPage() {
                     Analizuj
                   </button>
 
-                  <span className={`ml-auto rounded-full border px-2.5 py-1 text-xs ${pipelineTone}`}>Pipeline: {pipelineLabel(pipelineStep)}</span>
+                  <span className={`ml-auto rounded-full border px-2.5 py-1 text-xs ${pipelineTone}`}>
+                    Pipeline: {pipelineLabel(pipelineStep)}
+                  </span>
                 </div>
 
                 {transcriptToShow ? (
@@ -912,7 +1080,7 @@ export default function ExamPage() {
           </section>
         </div>
 
-        {/* Right: Report (dominant card) */}
+        {/* Right: Report */}
         <div className="lg:col-span-3">
           <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-md space-y-3">
             <div className="flex items-center justify-between gap-2">
@@ -924,7 +1092,11 @@ export default function ExamPage() {
               <div className="flex items-center gap-2">
                 <span className={`rounded-full border px-2.5 py-1 text-xs ${pipelineTone}`}>{pipelineLabel(pipelineStep)}</span>
 
-                <button className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50" onClick={saveReport} disabled={uiLocked}>
+                <button
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
+                  onClick={saveReport}
+                  disabled={uiLocked}
+                >
                   {savingReport ? "Zapisuję…" : "Zapisz"}
                 </button>
 
