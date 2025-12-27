@@ -9,6 +9,12 @@ import { getMyClinicId } from "@/lib/firebase/user";
 
 type ExamStatus = "draft" | "in_progress" | "done";
 
+type TranscriptQuality = {
+  score: number; // 0..100
+  flags?: string[];
+  metrics?: any;
+};
+
 type ExamDoc = {
   clinicId: string;
   patientId: string;
@@ -19,6 +25,9 @@ type ExamDoc = {
 
   transcript?: string;
   transcriptRaw?: string;
+
+  // NEW
+  transcriptQuality?: TranscriptQuality;
 
   analysis?: {
     sections?: {
@@ -119,6 +128,50 @@ function stepTone(done: boolean, active: boolean, blocked: boolean) {
   if (active) return tone("warn");
   if (blocked) return tone("bad");
   return tone("neutral");
+}
+
+// NEW: UI helper for transcript quality
+function getQualityUi(q?: TranscriptQuality) {
+  const score = typeof q?.score === "number" ? q.score : null;
+  const flags = Array.isArray(q?.flags) ? (q!.flags!.filter((x) => typeof x === "string") as string[]) : [];
+
+  if (score == null) {
+    return {
+      score: null as number | null,
+      kind: "neutral" as const,
+      title: "Jakość transkrypcji: —",
+      msg: null as string | null,
+      flags,
+    };
+  }
+
+  if (score >= 75) {
+    return {
+      score,
+      kind: "ok" as const,
+      title: `Jakość transkrypcji dobra (${score}/100)`,
+      msg: null as string | null,
+      flags,
+    };
+  }
+
+  if (score >= 60) {
+    return {
+      score,
+      kind: "warn" as const,
+      title: `Słabsza jakość transkrypcji (${score}/100)`,
+      msg: "Raport wygenerowany automatycznie może być niepełny. Prosimy zweryfikować kluczowe elementy.",
+      flags,
+    };
+  }
+
+  return {
+    score,
+    kind: "bad" as const,
+    title: `Słaba jakość transkrypcji (${score}/100)`,
+    msg: "Zalecane: sprawdź nagranie lub uruchom oczyszczanie audio i ponów transkrypcję (gdy dodamy tę funkcję).",
+    flags,
+  };
 }
 
 export default function ExamPage() {
@@ -683,7 +736,9 @@ export default function ExamPage() {
         const json = (parsed.kind === "json" ? parsed.json : null) as any;
 
         if (!res.ok || !json?.ok) {
-          throw new Error(json?.error || `Transkrypcja: HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`);
+          throw new Error(
+            json?.error || `Transkrypcja: HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`
+          );
         }
 
         await load();
@@ -792,6 +847,9 @@ export default function ExamPage() {
       ? tone("neutral")
       : tone("warn");
 
+  // NEW: transcript quality UI
+  const qUi = getQualityUi(exam?.transcriptQuality);
+
   return (
     <div className="space-y-5">
       {/* Alerts */}
@@ -818,12 +876,15 @@ export default function ExamPage() {
         <div>
           <div className="text-xl font-semibold tracking-tight">{typeLabel(exam.type)}</div>
           <div className="mt-1 text-xs text-slate-500">
-            Patient: <span className="font-mono">{patientIdFromParams}</span> • Exam: <span className="font-mono">{examId}</span>
+            Patient: <span className="font-mono">{patientIdFromParams}</span> • Exam:{" "}
+            <span className="font-mono">{examId}</span>
           </div>
         </div>
 
         <div className="flex items-center gap-2">
-          <span className={`rounded-full border px-2.5 py-1 text-xs ${tone(exam.status === "done" ? "ok" : "neutral")}`}>
+          <span
+            className={`rounded-full border px-2.5 py-1 text-xs ${tone(exam.status === "done" ? "ok" : "neutral")}`}
+          >
             Status: {exam.status === "draft" ? "Szkic" : exam.status === "in_progress" ? "W trakcie" : "Zakończone"}
           </span>
 
@@ -845,18 +906,42 @@ export default function ExamPage() {
       {/* Quiet Stepper */}
       <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepRecordingDone, activeRec, false)}`}>Nagranie</span>
-          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepTranscriptDone, activeTranscribe, transBlocked)}`}>Transkrypcja</span>
-          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepAnalysisDone, activeAnalyze, analyzeBlocked)}`}>Analiza</span>
-          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepReportDone, activeReport, reportBlocked)}`}>Raport</span>
+          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepRecordingDone, activeRec, false)}`}>
+            Nagranie
+          </span>
+          <span
+            className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepTranscriptDone, activeTranscribe, transBlocked)}`}
+          >
+            Transkrypcja
+          </span>
+          <span
+            className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepAnalysisDone, activeAnalyze, analyzeBlocked)}`}
+          >
+            Analiza
+          </span>
+          <span
+            className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepReportDone, activeReport, reportBlocked)}`}
+          >
+            Raport
+          </span>
 
           {hasAnyAnalysis && (
             <div className="ml-1 flex flex-wrap items-center gap-1 text-xs text-slate-500">
               <span className="ml-1">• Kompletność:</span>
-              <span className={`rounded-full border px-2 py-0.5 ${missing?.reason ? tone("bad") : tone("ok")}`}>Powód</span>
-              <span className={`rounded-full border px-2 py-0.5 ${missing?.findings ? tone("bad") : tone("ok")}`}>Opis</span>
-              <span className={`rounded-full border px-2 py-0.5 ${missing?.conclusions ? tone("bad") : tone("ok")}`}>Wnioski</span>
-              <span className={`rounded-full border px-2 py-0.5 ${missing?.recommendations ? tone("bad") : tone("ok")}`}>Zalecenia</span>
+              <span className={`rounded-full border px-2 py-0.5 ${missing?.reason ? tone("bad") : tone("ok")}`}>
+                Powód
+              </span>
+              <span className={`rounded-full border px-2 py-0.5 ${missing?.findings ? tone("bad") : tone("ok")}`}>
+                Opis
+              </span>
+              <span className={`rounded-full border px-2 py-0.5 ${missing?.conclusions ? tone("bad") : tone("ok")}`}>
+                Wnioski
+              </span>
+              <span
+                className={`rounded-full border px-2 py-0.5 ${missing?.recommendations ? tone("bad") : tone("ok")}`}
+              >
+                Zalecenia
+              </span>
             </div>
           )}
         </div>
@@ -988,7 +1073,8 @@ export default function ExamPage() {
 
                   {importFile ? (
                     <div className="text-xs text-slate-500 truncate">
-                      Wybrano: <span className="font-mono">{importFile.name}</span> • {Math.round(importFile.size / 1024)} KB
+                      Wybrano: <span className="font-mono">{importFile.name}</span> • {Math.round(importFile.size / 1024)}{" "}
+                      KB
                     </div>
                   ) : (
                     <div className="text-xs text-slate-500">Nie wybrano pliku</div>
@@ -1020,29 +1106,64 @@ export default function ExamPage() {
                 <div className="flex items-center justify-between gap-2">
                   <div className="text-sm font-semibold">Transkrypcja</div>
 
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      className={`rounded-full border px-2 py-0.5 text-xs ${
-                        !showRaw ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-700 border-slate-200"
-                      }`}
-                      onClick={() => setShowRaw(false)}
-                      disabled={!exam.transcript}
-                      type="button"
-                    >
-                      Czyste
-                    </button>
-                    <button
-                      className={`rounded-full border px-2 py-0.5 text-xs ${
-                        showRaw ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-700 border-slate-200"
-                      }`}
-                      onClick={() => setShowRaw(true)}
-                      disabled={!exam.transcriptRaw}
-                      type="button"
-                    >
-                      Surowe
-                    </button>
+                  <div className="flex items-center gap-2">
+                    {/* NEW: Quality pill */}
+                    {qUi.score != null && (
+                      <span className={`rounded-full border px-2.5 py-1 text-xs ${tone(qUi.kind)}`}>
+                        Quality: <span className="font-mono">{qUi.score}/100</span>
+                      </span>
+                    )}
+
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        className={`rounded-full border px-2 py-0.5 text-xs ${
+                          !showRaw
+                            ? "bg-slate-900 text-white border-slate-900"
+                            : "bg-white text-slate-700 border-slate-200"
+                        }`}
+                        onClick={() => setShowRaw(false)}
+                        disabled={!exam.transcript}
+                        type="button"
+                      >
+                        Czyste
+                      </button>
+                      <button
+                        className={`rounded-full border px-2 py-0.5 text-xs ${
+                          showRaw
+                            ? "bg-slate-900 text-white border-slate-900"
+                            : "bg-white text-slate-700 border-slate-200"
+                        }`}
+                        onClick={() => setShowRaw(true)}
+                        disabled={!exam.transcriptRaw}
+                        type="button"
+                      >
+                        Surowe
+                      </button>
+                    </div>
                   </div>
                 </div>
+
+                {/* NEW: Quality alert (3 progi) */}
+                {qUi.score != null && (qUi.kind === "warn" || qUi.kind === "bad") && (
+                  <div className={`rounded-2xl border p-3 text-sm ${tone(qUi.kind)}`}>
+                    <div className="font-semibold">{qUi.title}</div>
+                    {qUi.msg ? <div className="mt-1 text-xs opacity-90">{qUi.msg}</div> : null}
+
+                    {qUi.flags?.length ? (
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {qUi.flags.slice(0, 6).map((f) => (
+                          <span
+                            key={f}
+                            className="rounded-full border border-current/20 bg-white/50 px-2 py-0.5 text-[11px]"
+                            title={f}
+                          >
+                            {f}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                )}
 
                 <div className="flex flex-wrap gap-2 items-center">
                   <button
@@ -1090,7 +1211,9 @@ export default function ExamPage() {
               </div>
 
               <div className="flex items-center gap-2">
-                <span className={`rounded-full border px-2.5 py-1 text-xs ${pipelineTone}`}>{pipelineLabel(pipelineStep)}</span>
+                <span className={`rounded-full border px-2.5 py-1 text-xs ${pipelineTone}`}>
+                  {pipelineLabel(pipelineStep)}
+                </span>
 
                 <button
                   className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
