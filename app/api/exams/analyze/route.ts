@@ -8,7 +8,7 @@ import fs from "fs/promises";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 
-const PROMPT_VERSION = "analyze-v6-structured-clean";
+const PROMPT_VERSION = "analyze-v6-structured-clean+qualitygate-v1";
 
 // ---- LM Studio config ----
 function getLmConfig() {
@@ -64,8 +64,45 @@ function cleanMedicalPolish(input: string) {
   return s;
 }
 
+// ---- Quality helpers ----
+type TranscriptQuality = {
+  score?: number;
+  flags?: string[];
+  metrics?: any;
+};
+
+function getQualityBand(score: number | null) {
+  if (score == null) return { band: "unknown" as const, note: null as string | null };
+  if (score >= 75) return { band: "good" as const, note: null as string | null };
+  if (score >= 60)
+    return {
+      band: "medium" as const,
+      note: "Słabsza jakość transkrypcji — analiza może być niepełna, prosimy zweryfikować.",
+    };
+  return {
+    band: "low" as const,
+    note: "Słaba jakość transkrypcji — analiza może być istotnie niepełna. Rozważ oczyszczenie nagrania i ponowną transkrypcję.",
+  };
+}
+
 // ---- Prompt ----
-function buildSystemPrompt(examType: string) {
+function buildSystemPrompt(examType: string, transcriptQualityScore: number | null, transcriptQualityFlags: string[] | null) {
+  const q = transcriptQualityScore == null ? "unknown" : String(transcriptQualityScore);
+  const flags = transcriptQualityFlags?.length ? transcriptQualityFlags.join(", ") : "none";
+
+  const qualityAddendum =
+    transcriptQualityScore != null && transcriptQualityScore < 75
+      ? `
+UWAGA: Jakość transkrypcji jest NISKA/ŚREDNIA (score=${q}, flags=${flags}).
+Zasady dodatkowe:
+- BĄDŹ BARDZO KONSERWATYWNY: jeśli coś nie jest jednoznacznie powiedziane w transkrypcji, wpisz null.
+- NIE WNIOSKUJ, NIE DOMYŚLAJ SIĘ, NIE UZUPEŁNIAJ braków.
+- Jeśli masz wątpliwość co do narządu/pojęcia (np. "WSG", "szóstka", "mocznik" jako narząd), nie wyciągaj z tego faktu klinicznego — lepiej wpisz null lub pomiń.
+`
+      : `
+Informacja: Jakość transkrypcji wygląda na dobrą (score=${q}, flags=${flags}).
+`;
+
   return `
 Jesteś asystentem lekarza weterynarii. Masz WYŁĄCZNIE wyekstrahować informacje medyczne z transkrypcji i przypisać je do pól.
 
@@ -77,6 +114,8 @@ WYMÓG FORMATU:
 - Nie wymyślaj faktów.
 - Ignoruj komendy/uspokajanie/organizacyjne ("spokojnie", "nie ruszaj się", "moment", itp.).
 - Jeśli w transkrypcji jest oczywista literówka (np. "netki" -> "nerki", "brusznej" -> "brzusznej", "kęste" -> "gęste", "przeroźnięta" -> "przerośnięta"), popraw ją w polach wynikowych.
+
+${qualityAddendum}
 
 Sekcje (krótko, klinicznie):
 - reason: powód wizyty (1–2 zdania)
@@ -324,14 +363,30 @@ export async function POST(req: NextRequest) {
     const transcript: string | undefined = exam?.transcript;
     const examType: string = (exam?.type || "Badanie").toString();
 
+    // NEW: transcript quality (optional)
+    const tq: TranscriptQuality | undefined = exam?.transcriptQuality;
+    const transcriptQualityScore: number | null =
+      typeof tq?.score === "number" && Number.isFinite(tq.score) ? tq.score : null;
+    const transcriptQualityFlags: string[] | null = Array.isArray(tq?.flags)
+      ? tq!.flags.filter((x: any) => typeof x === "string")
+      : null;
+
+    const qualityBand = getQualityBand(transcriptQualityScore);
+
     if (!transcript || !transcript.trim()) {
       return NextResponse.json({ error: "No transcript in exam (analyze requires transcript)" }, { status: 400 });
     }
 
     const { baseUrl, model } = getLmConfig();
-    const system = buildSystemPrompt(examType);
+    const system = buildSystemPrompt(examType, transcriptQualityScore, transcriptQualityFlags);
 
-    const user = `TRANSKRYPCJA:\n${transcript.trim()}`;
+    // NEW: dodajemy kontekst jakości do user prompt (bez zmiany treści transkrypcji)
+    const qualityHeader =
+      transcriptQualityScore == null
+        ? `TRANSCRIPT_QUALITY_SCORE: unknown`
+        : `TRANSCRIPT_QUALITY_SCORE: ${transcriptQualityScore} (band=${qualityBand.band})`;
+
+    const user = `${qualityHeader}\nTRANSKRYPCJA:\n${transcript.trim()}`;
 
     // 1) call #1: z response_format
     let lm = await callLmChat({
@@ -438,6 +493,12 @@ export async function POST(req: NextRequest) {
         latencyMs,
         analyzedAt: new Date(),
         jsonRepaired: finalText !== content,
+
+        // NEW: quality trace
+        transcriptQualityScore,
+        transcriptQualityFlags,
+        transcriptQualityBand: qualityBand.band,
+        qualityNote: qualityBand.note,
       },
     });
 
@@ -451,6 +512,12 @@ export async function POST(req: NextRequest) {
         promptVersion: PROMPT_VERSION,
         latencyMs,
         jsonRepaired: finalText !== content,
+
+        // NEW: return quality info to UI
+        transcriptQualityScore,
+        transcriptQualityFlags,
+        transcriptQualityBand: qualityBand.band,
+        qualityNote: qualityBand.note,
       },
       docPath: examRef.path,
     });
