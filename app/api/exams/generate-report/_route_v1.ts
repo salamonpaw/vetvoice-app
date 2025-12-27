@@ -8,7 +8,7 @@ import fs from "fs/promises";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 
-const REPORT_VERSION = "analysis-template-v5-b1-structured-clean";
+const REPORT_VERSION = "analysis-template-v3-b1";
 
 async function getAdminDb() {
   const relPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
@@ -22,42 +22,13 @@ async function getAdminDb() {
   return getFirestore(app);
 }
 
-// ---- Text cleaning (deterministyczne) ----
-function cleanMedicalPolish(input: string) {
-  let s = input;
-
-  s = s.replace(/\bnetki\b/gi, "nerki");
-  s = s.replace(/\bbrusznej\b/gi, "brzusznej");
-  s = s.replace(/\bbruszna\b/gi, "brzuszna");
-  s = s.replace(/\bbruszny\b/gi, "brzuszny");
-  s = s.replace(/\bbrusznego\b/gi, "brzusznego");
-
-  s = s.replace(/\bprzeroźnion([aąeęyio])\b/gi, "przerośnięt$1");
-  s = s.replace(/\bprzeroźnięt([aąeęyio])\b/gi, "przerośnięt$1");
-  s = s.replace(/\bprzeroźnięta\b/gi, "przerośnięta");
-  s = s.replace(/\bprzeroźnięty\b/gi, "przerośnięty");
-  s = s.replace(/\bprzeroźnięte\b/gi, "przerośnięte");
-
-  s = s.replace(/\bkęst([eyąa])\b/gi, "gęst$1");
-
-  // opcjonalnie: cysta/cysty -> torbiel/torbiele (jak w analyze)
-  s = s.replace(/\bcystami\b/gi, "torbielami");
-  s = s.replace(/\bcystach\b/gi, "torbielach");
-  s = s.replace(/\bcysty\b/gi, "torbiele");
-  s = s.replace(/\bcysta\b/gi, "torbiel");
-  s = s.replace(/\bcyste\b/gi, "torbiele");
-
-  s = s.replace(/\s+/g, " ").trim();
-  return s;
-}
-
 function section(value?: string | null) {
   return value && value.trim() ? value.trim() : "—";
 }
 
 function normalizeSections(input: any) {
   const src = input ?? {};
-  const norm = (v: any) => (typeof v === "string" ? cleanMedicalPolish(v.trim()) : null);
+  const norm = (v: any) => (typeof v === "string" ? v.trim() : null);
 
   return {
     reason: norm(src.reason),
@@ -71,32 +42,6 @@ function isEmptyText(v?: string | null) {
   if (!v) return true;
   const t = v.trim();
   return !t || t === "—" || t.toLowerCase() === "brak" || t.toLowerCase() === "nie dotyczy";
-}
-
-function normalizeKeyFindings(arr: any): string[] | null {
-  if (!Array.isArray(arr)) return null;
-  const cleaned = arr
-    .filter((x) => typeof x === "string")
-    .map((x) => cleanMedicalPolish(x.trim()))
-    .filter(Boolean);
-
-  const uniq = Array.from(new Set(cleaned));
-  return uniq.length ? uniq : null;
-}
-
-// ---- examType fallback (deterministyczny) ----
-function inferExamTypeFallback(examType?: string, findings?: string | null, conclusions?: string | null) {
-  const t = (examType || "").toLowerCase();
-  const text = `${findings || ""} ${conclusions || ""}`.toLowerCase();
-
-  if (t.includes("usg")) return (examType || "USG").trim();
-
-  // heurystyka: jeśli opis dotyczy narządów jamy brzusznej, to to jest USG jamy brzusznej
-  if (/(wątro|śledzion|nerk|pęcherz|prostat|jama brzuszn)/.test(text)) {
-    return "USG jamy brzusznej";
-  }
-
-  return (examType || "Badanie").trim();
 }
 
 /**
@@ -116,33 +61,16 @@ function inferRecommendations(params: { findings?: string | null; conclusions?: 
 
   const hasAnyMedicalSignal = (patterns: RegExp[]) => patterns.some((p) => p.test(textAll));
 
-  // Układ moczowy / nerki / pęcherz
-  if (hasAnyMedicalSignal([/nerk/, /mocz/, /pęcherz/])) {
-    if (/(powiększon|poszerzon|zastój|wodonercz|kamień|złog|pogrub)/.test(textAll)) {
-      rulesHit.push("urinary_abnormal");
-      recs.push("Zaleca się badanie ogólne moczu; w razie wskazań rozważyć posiew moczu.");
-      recs.push("Zaleca się ocenę funkcji nerek (badanie krwi: mocznik, kreatynina) oraz kontrolę w zależności od objawów klinicznych.");
-      recs.push("Wskazana kontrola USG oraz dalsza diagnostyka zależnie od przebiegu klinicznego.");
+  // --- Reguły "twarde" (typowe i bezpieczne) ---
+  // Nerki / układ moczowy
+  if (hasAnyMedicalSignal([/nerk/, /mocz/, /pęcherz/, /pęcherz/])) {
+    if (/(powiększon|poszerzon|zastój|wodonercz|kamień|złog)/.test(textAll)) {
+      rulesHit.push("renal_abnormal");
+      recs.push("Zaleca się ocenę funkcji nerek (badanie krwi: mocznik, kreatynina) oraz badanie ogólne moczu.");
+      recs.push("Wskazana kontrola USG oraz dalsza diagnostyka w zależności od objawów klinicznych.");
     } else {
-      rulesHit.push("urinary_mention");
+      rulesHit.push("renal_mention");
       recs.push("W razie utrzymywania się objawów klinicznych rozważyć badanie ogólne moczu oraz kontrolę USG.");
-    }
-  }
-
-  // Zapalenie pęcherza / osad / piasek
-  if (hasAnyMedicalSignal([/zapalen.*pęcherz/, /osad/, /piasek/])) {
-    rulesHit.push("cystitis_sediment_context");
-    recs.push("Zaleca się badanie ogólne moczu; w razie wskazań rozważyć posiew moczu oraz kontrolę po leczeniu.");
-  }
-
-  // Prostata / przerost / torbiele
-  if (hasAnyMedicalSignal([/prostat/])) {
-    if (/(powiększon|przerost|torbiel|cyst)/.test(textAll)) {
-      rulesHit.push("prostate_abnormal");
-      recs.push("Zaleca się korelację z objawami klinicznymi i rozważenie leczenia zmniejszającego prostatę zgodnie z decyzją lekarza.");
-      recs.push("W przypadku utrzymywania się trudności w oddawaniu moczu wskazana kontrola i dalsza diagnostyka (np. badanie moczu).");
-    } else {
-      rulesHit.push("prostate_mention");
     }
   }
 
@@ -164,6 +92,7 @@ function inferRecommendations(params: { findings?: string | null; conclusions?: 
       recs.push("Wskazana korelacja z objawami oraz rozważenie badań dodatkowych zgodnie z decyzją lekarza prowadzącego.");
     } else {
       rulesHit.push("pancreas_mention");
+      // nie dokładamy na siłę, bo sama wzmianka "trzustka ok" nie wymaga zaleceń
     }
   }
 
@@ -179,23 +108,29 @@ function inferRecommendations(params: { findings?: string | null; conclusions?: 
 
   // Nowotworowe / guzy / podejrzenia
   if (hasAnyMedicalSignal([/nowotwor/, /guz/, /masa/, /zmiana ogniskowa/, /przerzut/])) {
+    // nawet jeśli "brak objawów nowotworowych", nadal można dać bezpieczną kontrolę zależnie od objawów
     rulesHit.push("oncology_context");
     recs.push("W przypadku niepokojących objawów klinicznych zaleca się kontrolę oraz diagnostykę zgodnie z decyzją lekarza.");
   }
 
+  // Jeśli w opisie wszystko "bez odchyleń", nie dodajemy zaleceń.
   const looksNormal = /(bez odchyleń|bez istotnych odchyleń|w normie|bez zmian)/.test(textAll);
-  const looksAbnormal = /(powiększon|poszerzon|zastój|kamień|złog|zmian|guz|masa|niejednorodn|obrzęk|zapalen|pogrub|torbiel|cyst)/.test(textAll);
+  const looksAbnormal = /(powiększon|poszerzon|zastój|kamień|złog|zmian|guz|masa|niejednorodn|obrzęk|zapalen|pogrub)/.test(textAll);
 
+  // Fallback: jeśli były jakiekolwiek nieprawidłowości, a reguły nic nie złapały, dodaj ogólne, bezpieczne.
   if (!looksNormal && looksAbnormal && recs.length === 0) {
     rulesHit.push("generic_abnormal_fallback");
     recs.push("Zaleca się korelację z objawami klinicznymi oraz rozważenie badań dodatkowych według decyzji lekarza.");
     recs.push("Wskazana kontrola w przypadku utrzymywania się lub nasilenia objawów.");
   }
 
+  // Jeśli wszystko wygląda normalnie i nie było reguł "abnormal", zwróć null (czyli w raporcie będzie "—").
   if (recs.length === 0) {
+    // nawet jeśli były wzmianki typu "trzustka ok", nie ma sensu generować zaleceń
     return { text: null, rulesHit };
   }
 
+  // Dedup + łączenie
   const uniq = Array.from(new Set(recs.map((x) => x.trim()).filter(Boolean)));
   return { text: uniq.join(" "), rulesHit };
 }
@@ -208,16 +143,9 @@ function buildReportFromAnalysis(params: {
     conclusions?: string | null;
     recommendations?: string | null;
   };
-  keyFindings?: string[] | null;
 }) {
+  const examType = (params.examType || "Badanie").trim();
   const s = params.sections || {};
-  const examType = inferExamTypeFallback(params.examType, s.findings, s.conclusions);
-
-  const kf = Array.isArray(params.keyFindings) ? params.keyFindings : null;
-  const keyFindingsBlock =
-    kf && kf.length
-      ? [``, `Najważniejsze ustalenia:`, kf.slice(0, 8).map((x) => `- ${x}`).join("\n")].join("\n")
-      : "";
 
   return [
     `RAPORT BADANIA: ${examType}`,
@@ -227,7 +155,6 @@ function buildReportFromAnalysis(params: {
     ``,
     `Opis badania:`,
     section(s.findings),
-    keyFindingsBlock,
     ``,
     `Wnioski:`,
     section(s.conclusions),
@@ -248,6 +175,7 @@ export async function POST(req: NextRequest) {
       examId?: string;
     };
 
+    // clinicId opcjonalne (dual-path)
     if (!patientId || !examId) {
       return NextResponse.json({ error: "Missing patientId or examId" }, { status: 400 });
     }
@@ -268,7 +196,10 @@ export async function POST(req: NextRequest) {
 
     if (!snap.exists) {
       return NextResponse.json(
-        { error: "Exam not found", tried: { pathA: refA.path, pathB: refB?.path ?? null } },
+        {
+          error: "Exam not found",
+          tried: { pathA: refA.path, pathB: refB?.path ?? null },
+        },
         { status: 404 }
       );
     }
@@ -277,16 +208,16 @@ export async function POST(req: NextRequest) {
 
     const rawSections = exam?.analysis?.sections;
     if (!rawSections) {
-      return NextResponse.json({ error: "Missing analysis.sections — run /api/exams/analyze first" }, { status: 400 });
+      return NextResponse.json(
+        { error: "Missing analysis.sections — run /api/exams/analyze first" },
+        { status: 400 }
+      );
     }
 
     const sections = normalizeSections(rawSections);
-    const keyFindings = normalizeKeyFindings(exam?.analysis?.keyFindings);
 
     // Jeśli recommendations puste -> B1: spróbuj wywnioskować deterministycznie
     let inferredRules: string[] = [];
-    const rawHadRecommendations = !isEmptyText(rawSections?.recommendations);
-
     if (isEmptyText(sections.recommendations)) {
       const inferred = inferRecommendations({
         findings: sections.findings,
@@ -294,12 +225,13 @@ export async function POST(req: NextRequest) {
       });
       inferredRules = inferred.rulesHit;
       if (inferred.text) {
-        sections.recommendations = cleanMedicalPolish(inferred.text);
+        sections.recommendations = inferred.text;
       } else {
-        sections.recommendations = null;
+        sections.recommendations = null; // w raporcie pokaże "—"
       }
     }
 
+    // (opcjonalnie) walidacja: jeśli WSZYSTKO null -> raczej analiza była pusta
     const allEmpty = !sections.reason && !sections.findings && !sections.conclusions && !sections.recommendations;
     if (allEmpty) {
       return NextResponse.json(
@@ -314,7 +246,6 @@ export async function POST(req: NextRequest) {
     const report = buildReportFromAnalysis({
       examType: exam?.type,
       sections,
-      keyFindings,
     });
 
     const quality = {
@@ -322,10 +253,6 @@ export async function POST(req: NextRequest) {
       hasFindings: !!sections.findings,
       hasConclusions: !!sections.conclusions,
       hasRecommendations: !!sections.recommendations,
-      hasKeyFindings: !!(keyFindings && keyFindings.length),
-      inferredRecommendationsUsed: !rawHadRecommendations && !!sections.recommendations,
-      rulesHitCount: inferredRules.length,
-      examTypeEffective: inferExamTypeFallback(exam?.type, sections.findings, sections.conclusions),
     };
 
     await examRef.update({
@@ -336,17 +263,18 @@ export async function POST(req: NextRequest) {
         engine: "template-from-analysis",
         basedOn: "analysis.sections",
         b1: {
-          inferredRecommendations: !rawHadRecommendations,
+          inferredRecommendations: isEmptyText(rawSections?.recommendations),
           inferredRules,
         },
       },
       reportQuality: quality,
     });
 
+    // UWAGA: UI czasem chciało report "od razu". Możesz też zwracać report w response:
     return NextResponse.json({
       ok: true,
       docPath: examRef.path,
-      report,
+      report, // <- dodane celowo, żeby UI mogło ustawić draft natychmiast po 1 kliknięciu
       reportPreview: report.slice(0, 500),
       reportQuality: quality,
       inferredRules,
