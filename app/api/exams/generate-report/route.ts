@@ -8,7 +8,7 @@ import fs from "fs/promises";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 
-const REPORT_VERSION = "analysis-template-v5-b1-structured-clean";
+const REPORT_VERSION = "analysis-template-v8-vet-golden-v1";
 
 async function getAdminDb() {
   const relPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
@@ -18,13 +18,13 @@ async function getAdminDb() {
   const raw = await fs.readFile(absPath, "utf-8");
   const serviceAccount = JSON.parse(raw);
 
-  const app = getApps().length > 0 ? getApps()[0] : initializeApp({ credential: cert(serviceAccount) });
+  const app =
+    getApps().length > 0 ? getApps()[0] : initializeApp({ credential: cert(serviceAccount) });
   return getFirestore(app);
 }
 
-// ---- Text cleaning (deterministyczne) ----
 function cleanMedicalPolish(input: string) {
-  let s = input;
+  let s = input || "";
 
   s = s.replace(/\bnetki\b/gi, "nerki");
   s = s.replace(/\bbrusznej\b/gi, "brzusznej");
@@ -40,19 +40,31 @@ function cleanMedicalPolish(input: string) {
 
   s = s.replace(/\bkęst([eyąa])\b/gi, "gęst$1");
 
-  // opcjonalnie: cysta/cysty -> torbiel/torbiele (jak w analyze)
   s = s.replace(/\bcystami\b/gi, "torbielami");
   s = s.replace(/\bcystach\b/gi, "torbielach");
   s = s.replace(/\bcysty\b/gi, "torbiele");
   s = s.replace(/\bcysta\b/gi, "torbiel");
   s = s.replace(/\bcyste\b/gi, "torbiele");
 
+  // lekkie „mini-cleanup” (bez pełnego mini-korektora)
+  s = s.replace(/\bzwiększoną naczynienie\b/gi, "zwiększone unaczynienie");
+  s = s.replace(/\bniereguralny\b/gi, "nieregularny");
+  s = s.replace(/\bpęcharz\b/gi, "pęcherz");
+  s = s.replace(/\bjomy\b/gi, "jamy");
+  s = s.replace(/\bwpłynu\b/gi, "płynu");
+
   s = s.replace(/\s+/g, " ").trim();
   return s;
 }
 
-function section(value?: string | null) {
-  return value && value.trim() ? value.trim() : "—";
+function safeOneLine(s: string) {
+  return cleanMedicalPolish((s || "").replace(/\r?\n|\r/g, " ").replace(/\s+/g, " ").trim());
+}
+
+function isEmptyText(v?: string | null) {
+  if (!v) return true;
+  const t = v.trim();
+  return !t || t === "—" || t.toLowerCase() === "brak" || t.toLowerCase() === "nie dotyczy";
 }
 
 function normalizeSections(input: any) {
@@ -67,12 +79,6 @@ function normalizeSections(input: any) {
   };
 }
 
-function isEmptyText(v?: string | null) {
-  if (!v) return true;
-  const t = v.trim();
-  return !t || t === "—" || t.toLowerCase() === "brak" || t.toLowerCase() === "nie dotyczy";
-}
-
 function normalizeKeyFindings(arr: any): string[] | null {
   if (!Array.isArray(arr)) return null;
   const cleaned = arr
@@ -84,134 +90,182 @@ function normalizeKeyFindings(arr: any): string[] | null {
   return uniq.length ? uniq : null;
 }
 
-// ---- examType fallback (deterministyczny) ----
 function inferExamTypeFallback(examType?: string, findings?: string | null, conclusions?: string | null) {
   const t = (examType || "").toLowerCase();
   const text = `${findings || ""} ${conclusions || ""}`.toLowerCase();
 
   if (t.includes("usg")) return (examType || "USG").trim();
-
-  // heurystyka: jeśli opis dotyczy narządów jamy brzusznej, to to jest USG jamy brzusznej
-  if (/(wątro|śledzion|nerk|pęcherz|prostat|jama brzuszn)/.test(text)) {
-    return "USG jamy brzusznej";
-  }
-
+  if (/(wątro|śledzion|nerk|pęcherz|jelit|jama brzuszn)/.test(text)) return "USG jamy brzusznej";
   return (examType || "Badanie").trim();
 }
 
-/**
- * B1: deterministyczne zalecenia (bez AI).
- * Zasady:
- * - Jeśli recommendations istnieje -> używamy go.
- * - Jeśli brak -> generujemy "bezpieczne" zalecenia zależnie od findings/conclusions.
- * - Nigdy nie wymyślamy diagnozy; zalecenia to "rozważyć / zaleca się / wskazana kontrola".
- */
-function inferRecommendations(params: { findings?: string | null; conclusions?: string | null }): { text: string | null; rulesHit: string[] } {
-  const findings = (params.findings || "").toLowerCase();
-  const conclusions = (params.conclusions || "").toLowerCase();
-  const textAll = `${findings}\n${conclusions}`;
+function makeFallbackSections(score: number | null) {
+  const concl =
+    typeof score === "number" && score < 60
+      ? "Materiał niewystarczający do jednoznacznej analizy (niska jakość transkrypcji) — proszę zweryfikować."
+      : "Materiał niewystarczający do jednoznacznej analizy — proszę zweryfikować.";
 
-  const rulesHit: string[] = [];
-  const recs: string[] = [];
-
-  const hasAnyMedicalSignal = (patterns: RegExp[]) => patterns.some((p) => p.test(textAll));
-
-  // Układ moczowy / nerki / pęcherz
-  if (hasAnyMedicalSignal([/nerk/, /mocz/, /pęcherz/])) {
-    if (/(powiększon|poszerzon|zastój|wodonercz|kamień|złog|pogrub)/.test(textAll)) {
-      rulesHit.push("urinary_abnormal");
-      recs.push("Zaleca się badanie ogólne moczu; w razie wskazań rozważyć posiew moczu.");
-      recs.push("Zaleca się ocenę funkcji nerek (badanie krwi: mocznik, kreatynina) oraz kontrolę w zależności od objawów klinicznych.");
-      recs.push("Wskazana kontrola USG oraz dalsza diagnostyka zależnie od przebiegu klinicznego.");
-    } else {
-      rulesHit.push("urinary_mention");
-      recs.push("W razie utrzymywania się objawów klinicznych rozważyć badanie ogólne moczu oraz kontrolę USG.");
-    }
-  }
-
-  // Zapalenie pęcherza / osad / piasek
-  if (hasAnyMedicalSignal([/zapalen.*pęcherz/, /osad/, /piasek/])) {
-    rulesHit.push("cystitis_sediment_context");
-    recs.push("Zaleca się badanie ogólne moczu; w razie wskazań rozważyć posiew moczu oraz kontrolę po leczeniu.");
-  }
-
-  // Prostata / przerost / torbiele
-  if (hasAnyMedicalSignal([/prostat/])) {
-    if (/(powiększon|przerost|torbiel|cyst)/.test(textAll)) {
-      rulesHit.push("prostate_abnormal");
-      recs.push("Zaleca się korelację z objawami klinicznymi i rozważenie leczenia zmniejszającego prostatę zgodnie z decyzją lekarza.");
-      recs.push("W przypadku utrzymywania się trudności w oddawaniu moczu wskazana kontrola i dalsza diagnostyka (np. badanie moczu).");
-    } else {
-      rulesHit.push("prostate_mention");
-    }
-  }
-
-  // Wątroba / drogi żółciowe
-  if (hasAnyMedicalSignal([/wątro/, /żółci/, /pęcherzyk żółciowy/, /cholestaz/, /drogi żółci/])) {
-    if (/(powiększon|zmian|niejednorodn|stłuszcz|zastój|poszerzon)/.test(textAll)) {
-      rulesHit.push("liver_abnormal");
-      recs.push("Zaleca się badania laboratoryjne (profil wątrobowy) oraz kontrolę w zależności od obrazu klinicznego.");
-    } else {
-      rulesHit.push("liver_mention");
-      recs.push("Kontrola w zależności od objawów klinicznych; rozważyć badania krwi przy podejrzeniu choroby wątroby.");
-    }
-  }
-
-  // Trzustka
-  if (hasAnyMedicalSignal([/trzustk/])) {
-    if (/(zapalen|zmian|obrzęk|niejednorodn)/.test(textAll)) {
-      rulesHit.push("pancreas_abnormal");
-      recs.push("Wskazana korelacja z objawami oraz rozważenie badań dodatkowych zgodnie z decyzją lekarza prowadzącego.");
-    } else {
-      rulesHit.push("pancreas_mention");
-    }
-  }
-
-  // Śledziona
-  if (hasAnyMedicalSignal([/śledzion/])) {
-    if (/(powiększon|zmian|guz|ognisk)/.test(textAll)) {
-      rulesHit.push("spleen_abnormal");
-      recs.push("Zaleca się dalszą diagnostykę w zależności od obrazu klinicznego oraz rozważenie kontroli obrazowej.");
-    } else {
-      rulesHit.push("spleen_mention");
-    }
-  }
-
-  // Nowotworowe / guzy / podejrzenia
-  if (hasAnyMedicalSignal([/nowotwor/, /guz/, /masa/, /zmiana ogniskowa/, /przerzut/])) {
-    rulesHit.push("oncology_context");
-    recs.push("W przypadku niepokojących objawów klinicznych zaleca się kontrolę oraz diagnostykę zgodnie z decyzją lekarza.");
-  }
-
-  const looksNormal = /(bez odchyleń|bez istotnych odchyleń|w normie|bez zmian)/.test(textAll);
-  const looksAbnormal = /(powiększon|poszerzon|zastój|kamień|złog|zmian|guz|masa|niejednorodn|obrzęk|zapalen|pogrub|torbiel|cyst)/.test(textAll);
-
-  if (!looksNormal && looksAbnormal && recs.length === 0) {
-    rulesHit.push("generic_abnormal_fallback");
-    recs.push("Zaleca się korelację z objawami klinicznymi oraz rozważenie badań dodatkowych według decyzji lekarza.");
-    recs.push("Wskazana kontrola w przypadku utrzymywania się lub nasilenia objawów.");
-  }
-
-  if (recs.length === 0) {
-    return { text: null, rulesHit };
-  }
-
-  const uniq = Array.from(new Set(recs.map((x) => x.trim()).filter(Boolean)));
-  return { text: uniq.join(" "), rulesHit };
+  return {
+    reason: "Nie podano w nagraniu (badanie diagnostyczne).",
+    findings: "Brak jednoznacznego opisu narządów w transkrypcji.",
+    conclusions: concl,
+    recommendations: "W razie potrzeby powtórzyć nagranie lub uzupełnić opis badania w dokumentacji.",
+  };
 }
 
-function buildReportFromAnalysis(params: {
-  examType?: string;
-  sections: {
-    reason?: string | null;
-    findings?: string | null;
-    conclusions?: string | null;
-    recommendations?: string | null;
-  };
-  keyFindings?: string[] | null;
+function extractPatientLabel(exam: any, transcript?: string | null) {
+  // 1) jeśli analiza wyciągnęła pacjenta – użyj tego
+  const name = exam?.analysis?.entities?.patientName ? String(exam.analysis.entities.patientName) : null;
+  if (name && name.trim()) return name.trim();
+
+  // 2) heurystyka z transkrypcji: "badanie <Imię>" / "pacjent ... imię"
+  const t = (transcript || "").toLowerCase();
+  const m1 = t.match(/\bbadanie\s+([a-ząćęłńóśźż][a-ząćęłńóśźż-]{1,25})\b/i);
+  if (m1?.[1]) return m1[1];
+
+  const m2 = t.match(/\bimi[eę]\s+([a-ząćęłńóśźż][a-ząćęłńóśźż-]{1,25})\b/i);
+  if (m2?.[1]) return m2[1];
+
+  return null;
+}
+
+function extractConditions(transcript?: string | null) {
+  const t = (transcript || "").toLowerCase();
+  const parts: string[] = [];
+
+  if (/\bbez sedacji\b/.test(t)) parts.push("bez sedacji");
+  if (/\bsedacj[ai]\b/.test(t) && !/\bbez sedacji\b/.test(t)) parts.push("w sedacji");
+
+  if (/\bpozycj[ai]\s+grzbietow/.test(t)) parts.push("pozycja grzbietowa");
+  if (/\bpozycj[ai]\s+bocz/.test(t)) parts.push("pozycja boczna");
+
+  if (/\bniespokojn/.test(t)) parts.push("pacjent okresowo niespokojny");
+
+  return parts.length ? cleanMedicalPolish(parts.join(", ")) : null;
+}
+
+function smartReasonFallback(reason: string | null, examType: string) {
+  // jeśli reason jest pusty albo bezsensownie powtarza typ badania — daj wet fallback
+  if (isEmptyText(reason)) return "Nie podano w nagraniu (badanie diagnostyczne).";
+
+  const r = (reason ?? "").toLowerCase();
+  const et = (examType ?? "").toLowerCase();
+
+  if (r.includes("badanie usg") || r === et || r.includes("usg jamy brzusznej")) {
+    return "Nie podano w nagraniu (badanie diagnostyczne).";
+  }
+
+  return reason;
+}
+
+function bulletizeFindings(text: string) {
+  // prosta, deterministyczna poprawa czytelności:
+  // - dzieli po kropkach na zdania
+  // - wybiera sensowne zdania > 15 znaków
+  const cleaned = cleanMedicalPolish(text);
+  const sentences = cleaned
+    .split(/(?<=[.?!])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 15);
+
+  if (sentences.length <= 2) {
+    // zostaw jako akapit, jeśli krótko
+    return cleaned;
+  }
+
+  return sentences.map((s) => `- ${s.replace(/\.$/, "")}.`).join("\n");
+}
+
+function deriveVetConclusionsAndRecs(params: {
+  findingsText: string;
+  keyFindings: string[] | null;
+  transcript?: string | null;
 }) {
-  const s = params.sections || {};
+  const full = `${params.findingsText || ""} ${(params.transcript || "")}`.toLowerCase();
+  const kf = (params.keyFindings || []).join(" ").toLowerCase();
+
+  const hasForeignBody =
+    /ciał[oa]\s+obc|obecno[śćsc]\s+c[ia]ł[oa]\s+obc|struktura.*cień akustyczny|cień akustyczny/.test(full);
+
+  const hasPartialObstruction = /niedrożno[śćsc]|poszerzone światło|nagromadzenie płynnej treści/.test(full);
+
+  const hasInflammation =
+    /stan zapalny|zwiększone unaczynienie|pogrubienie ściany|zatarta warstwowość|osłabiona perystaltyka/.test(full);
+
+  const hasFreeFluid = /woln(y|ego)\s+płyn|płynu wolnego|między pętlami/.test(full);
+
+  const hasMesentericNodes = /węzł(y|ów)\s+chłonn(e|ych)\s+kręsk/.test(full);
+
+  const conclusions: string[] = [];
+
+  if (hasInflammation) conclusions.push("Obraz jelita cienkiego odpowiada zmianom zapalnym z towarzyszącą hipomotoryką.");
+  if (hasForeignBody) conclusions.push("Zmiana w świetle jelita z cieniem akustycznym — wysokie podejrzenie ciała obcego.");
+  if (hasPartialObstruction && hasForeignBody) conclusions.push("Obraz sugeruje częściową niedrożność w przebiegu podejrzenia ciała obcego.");
+  if (hasMesentericNodes) conclusions.push("Wtórne zmiany odczynowe w węzłach chłonnych krezkowych.");
+  if (hasFreeFluid) conclusions.push("Niewielka ilość wolnego płynu w jamie brzusznej (odczynowy/zapalny).");
+
+  // jeśli nic nie wykryliśmy, spróbuj z keyFindings
+  if (!conclusions.length && kf) {
+    conclusions.push("W badaniu opisano istotne odchylenia — proszę zweryfikować opis oraz obraz kliniczny pacjenta.");
+  }
+
+  const recommendations: string[] = [];
+  if (hasForeignBody || hasPartialObstruction) {
+    recommendations.push("Pilna konsultacja chirurgiczna / postępowanie chirurgiczne zgodnie z obrazem klinicznym.");
+    recommendations.push("Rozważyć RTG jamy brzusznej lub TK w celu potwierdzenia lokalizacji i planowania zabiegu.");
+    recommendations.push("Monitorować stan ogólny pacjenta oraz parametry życiowe.");
+  } else if (hasInflammation) {
+    recommendations.push("Korelacja z objawami klinicznymi i badaniami laboratoryjnymi; rozważyć kontrolne USG.");
+  } else {
+    recommendations.push("W razie potrzeby uzupełnić opis badania w dokumentacji lub wykonać badanie kontrolne.");
+  }
+
+  return {
+    conclusionsText: conclusions.length ? conclusions.map((x, i) => `${i + 1}. ${x}`).join("\n") : "—",
+    recommendationsText: recommendations.length ? recommendations.map((x) => `- ${x}`).join("\n") : "—",
+  };
+}
+
+function buildReport(params: {
+  examType?: string;
+  patientLabel?: string | null;
+  conditions?: string | null;
+  sections: { reason?: string | null; findings?: string | null; conclusions?: string | null; recommendations?: string | null };
+  keyFindings?: string[] | null;
+  transcript?: string | null;
+  transcriptQualityScore?: number | null;
+  transcriptQualityFlags?: string[] | null;
+  fallbackUsed: boolean;
+}) {
+  const s = params.sections;
   const examType = inferExamTypeFallback(params.examType, s.findings, s.conclusions);
+
+  const title = params.patientLabel
+    ? `${examType} – ${params.patientLabel}`
+    : `${examType}`;
+
+  const reason = smartReasonFallback(s.reason ?? null, examType);
+
+  const findingsRaw = isEmptyText(s.findings)
+    ? "Brak jednoznacznego opisu narządów w transkrypcji."
+    : (s.findings || "").trim();
+
+  const findings = bulletizeFindings(findingsRaw);
+
+  let conclusions = isEmptyText(s.conclusions) ? null : (s.conclusions || "").trim();
+  let recommendations = isEmptyText(s.recommendations) ? null : (s.recommendations || "").trim();
+
+  // jeśli brakuje wniosków lub zaleceń — wypełnij deterministycznie (wet)
+  if (!conclusions || !recommendations) {
+    const derived = deriveVetConclusionsAndRecs({
+      findingsText: findingsRaw,
+      keyFindings: params.keyFindings || null,
+      transcript: params.transcript || null,
+    });
+
+    if (!conclusions) conclusions = derived.conclusionsText;
+    if (!recommendations) recommendations = derived.recommendationsText;
+  }
 
   const kf = Array.isArray(params.keyFindings) ? params.keyFindings : null;
   const keyFindingsBlock =
@@ -219,25 +273,50 @@ function buildReportFromAnalysis(params: {
       ? [``, `Najważniejsze ustalenia:`, kf.slice(0, 8).map((x) => `- ${x}`).join("\n")].join("\n")
       : "";
 
+  const qScore = params.transcriptQualityScore;
+  const qFlags = params.transcriptQualityFlags?.length ? params.transcriptQualityFlags.join(", ") : null;
+
+  const qualityLine =
+    typeof qScore === "number"
+      ? `Jakość transkrypcji: ${qScore}/100${qFlags ? ` (flags: ${qFlags})` : ""}`
+      : "Jakość transkrypcji: brak danych";
+
+  const banner = params.fallbackUsed
+    ? "⚠ RAPORT TECHNICZNY (brak jednoznacznych danych klinicznych w analizie) — wymaga weryfikacji lekarza."
+    : null;
+
+  const source =
+    params.transcript && params.transcript.trim()
+      ? safeOneLine(params.transcript).slice(0, 900)
+      : null;
+
   return [
-    `RAPORT BADANIA: ${examType}`,
+    `RAPORT BADANIA: ${title}`,
+    banner ? banner : null,
     ``,
     `Powód wizyty:`,
-    section(s.reason),
+    reason,
     ``,
+    params.conditions ? `Warunki badania:\n${params.conditions}\n` : null,
     `Opis badania:`,
-    section(s.findings),
+    findings,
     keyFindingsBlock,
     ``,
     `Wnioski:`,
-    section(s.conclusions),
+    conclusions || "—",
     ``,
     `Zalecenia:`,
-    section(s.recommendations),
+    recommendations || "—",
     ``,
     `---`,
+    qualityLine,
     `Raport wygenerowany automatycznie na podstawie analizy transkrypcji.`,
-  ].join("\n");
+    source
+      ? [``, `---`, `Źródło (transkrypcja):`, source].join("\n")
+      : null,
+  ]
+    .filter((x) => x != null)
+    .join("\n");
 }
 
 export async function POST(req: NextRequest) {
@@ -254,7 +333,6 @@ export async function POST(req: NextRequest) {
 
     const adminDb = await getAdminDb();
 
-    // Dual-path lookup
     const refA = adminDb.doc(`patients/${patientId}/exams/${examId}`);
     const refB = clinicId ? adminDb.doc(`clinics/${clinicId}/patients/${patientId}/exams/${examId}`) : null;
 
@@ -275,57 +353,56 @@ export async function POST(req: NextRequest) {
 
     const exam = snap.data() as any;
 
-    const rawSections = exam?.analysis?.sections;
-    if (!rawSections) {
-      return NextResponse.json({ error: "Missing analysis.sections — run /api/exams/analyze first" }, { status: 400 });
-    }
+    const transcript: string | null = exam?.transcript ? String(exam.transcript) : null;
+    const tqScore: number | null =
+      typeof exam?.transcriptQuality?.score === "number" ? exam.transcriptQuality.score : null;
+    const tqFlags: string[] | null =
+      Array.isArray(exam?.transcriptQuality?.flags) ? exam.transcriptQuality.flags : null;
 
-    const sections = normalizeSections(rawSections);
+    const rawSections = exam?.analysis?.sections || null;
     const keyFindings = normalizeKeyFindings(exam?.analysis?.keyFindings);
 
-    // Jeśli recommendations puste -> B1: spróbuj wywnioskować deterministycznie
-    let inferredRules: string[] = [];
-    const rawHadRecommendations = !isEmptyText(rawSections?.recommendations);
+    let sections = normalizeSections(rawSections);
 
-    if (isEmptyText(sections.recommendations)) {
-      const inferred = inferRecommendations({
-        findings: sections.findings,
-        conclusions: sections.conclusions,
-      });
-      inferredRules = inferred.rulesHit;
-      if (inferred.text) {
-        sections.recommendations = cleanMedicalPolish(inferred.text);
-      } else {
-        sections.recommendations = null;
-      }
+    const emptyAll =
+      isEmptyText(sections.reason) &&
+      isEmptyText(sections.findings) &&
+      isEmptyText(sections.conclusions) &&
+      isEmptyText(sections.recommendations);
+
+    let fallbackUsed = false;
+    if (emptyAll) {
+      fallbackUsed = true;
+      const fb = makeFallbackSections(tqScore);
+      sections = { ...fb };
     }
 
-    const allEmpty = !sections.reason && !sections.findings && !sections.conclusions && !sections.recommendations;
-    if (allEmpty) {
-      return NextResponse.json(
-        {
-          error: "analysis.sections present but empty",
-          hint: "Analiza nie wyciągnęła żadnych sekcji. Sprawdź /api/exams/analyze (prompt / JSON).",
-        },
-        { status: 400 }
-      );
-    }
+    const patientLabel = extractPatientLabel(exam, transcript);
+    const conditions = extractConditions(transcript);
 
-    const report = buildReportFromAnalysis({
+    const report = buildReport({
       examType: exam?.type,
+      patientLabel,
+      conditions,
       sections,
       keyFindings,
+      transcript,
+      transcriptQualityScore: tqScore,
+      transcriptQualityFlags: tqFlags,
+      fallbackUsed,
     });
 
-    const quality = {
-      hasReason: !!sections.reason,
-      hasFindings: !!sections.findings,
-      hasConclusions: !!sections.conclusions,
-      hasRecommendations: !!sections.recommendations,
+    const reportQuality = {
+      hasReason: !isEmptyText(sections.reason),
+      hasFindings: !isEmptyText(sections.findings),
+      hasConclusions: !isEmptyText(sections.conclusions),
+      hasRecommendations: !isEmptyText(sections.recommendations),
       hasKeyFindings: !!(keyFindings && keyFindings.length),
-      inferredRecommendationsUsed: !rawHadRecommendations && !!sections.recommendations,
-      rulesHitCount: inferredRules.length,
+      fallbackUsed,
+      transcriptQualityScore: tqScore,
       examTypeEffective: inferExamTypeFallback(exam?.type, sections.findings, sections.conclusions),
+      patientLabel: patientLabel || null,
+      conditions: conditions || null,
     };
 
     await examRef.update({
@@ -333,23 +410,19 @@ export async function POST(req: NextRequest) {
       reportedAt: new Date(),
       reportMeta: {
         version: REPORT_VERSION,
-        engine: "template-from-analysis",
-        basedOn: "analysis.sections",
-        b1: {
-          inferredRecommendations: !rawHadRecommendations,
-          inferredRules,
-        },
+        engine: "template-from-analysis-vet",
+        basedOn: "analysis.sections + transcript heuristics + deterministic fill",
+        fallbackUsed,
       },
-      reportQuality: quality,
+      reportQuality,
     });
 
     return NextResponse.json({
       ok: true,
       docPath: examRef.path,
-      report,
-      reportPreview: report.slice(0, 500),
-      reportQuality: quality,
-      inferredRules,
+      reportPreview: report.slice(0, 1100),
+      reportQuality,
+      fallbackUsed,
     });
   } catch (err: any) {
     console.error("GENERATE REPORT ERROR:", err);

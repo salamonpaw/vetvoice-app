@@ -8,16 +8,10 @@ import fs from "fs/promises";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 
-const PROMPT_VERSION = "analyze-v6-structured-clean+qualitygate-v1";
+const PROMPT_VERSION = "analyze-v10-json_schema-response_format-retry-fallback";
 
-// ---- LM Studio config ----
-function getLmConfig() {
-  const baseUrl = process.env.LMSTUDIO_BASE_URL || "http://127.0.0.1:11434";
-  const model = process.env.LMSTUDIO_MODEL || "qwen2.5-14b-instruct";
-  return { baseUrl, model };
-}
+// ================= Firebase Admin =================
 
-// ---- Firebase Admin ----
 async function getAdminDb() {
   const relPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
   if (!relPath) throw new Error("Missing env FIREBASE_SERVICE_ACCOUNT_PATH (in .env.local)");
@@ -26,49 +20,175 @@ async function getAdminDb() {
   const raw = await fs.readFile(absPath, "utf-8");
   const serviceAccount = JSON.parse(raw);
 
-  const app = getApps().length > 0 ? getApps()[0] : initializeApp({ credential: cert(serviceAccount) });
+  const app =
+    getApps().length > 0 ? getApps()[0] : initializeApp({ credential: cert(serviceAccount) });
+
   return getFirestore(app);
 }
 
-// ---- Text cleaning (deterministyczne) ----
-function cleanMedicalPolish(input: string) {
-  let s = input;
+// ================= LM Studio =================
 
-  // częste błędy STT / odmiany
+function getLmConfig() {
+  const baseUrl = process.env.LMSTUDIO_BASE_URL || "http://127.0.0.1:11434";
+  const model = process.env.LMSTUDIO_MODEL || "qwen2.5-14b-instruct-1m";
+  const apiKey = process.env.LMSTUDIO_API_KEY || "lm-studio";
+  return { baseUrl, model, apiKey };
+}
+
+function getAnalysisJsonSchema() {
+  // JSON Schema (Draft 2020-12-ish). LM Studio wymaga type=json_schema.
+  // Trzymamy proste typy i nullable przez anyOf.
+  const nullableString = { anyOf: [{ type: "string" }, { type: "null" }] };
+  const nullableStringArray = {
+    anyOf: [{ type: "array", items: { type: "string" } }, { type: "null" }],
+  };
+
+  return {
+    name: "vetvoice_analysis",
+    strict: true,
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        sections: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            reason: nullableString,
+            findings: nullableString,
+            conclusions: nullableString,
+            recommendations: nullableString,
+          },
+          required: ["reason", "findings", "conclusions", "recommendations"],
+        },
+        entities: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            patientName: nullableString,
+            organsMentioned: nullableStringArray,
+            problemsMentioned: nullableStringArray,
+          },
+          required: ["patientName", "organsMentioned", "problemsMentioned"],
+        },
+        keyFindings: nullableStringArray,
+        evidence: {
+          anyOf: [
+            {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  claim: { type: "string" },
+                  quote: { type: "string" },
+                },
+                required: ["claim", "quote"],
+              },
+            },
+            { type: "null" },
+          ],
+        },
+      },
+      required: ["sections", "entities", "keyFindings", "evidence"],
+    },
+  };
+}
+
+async function callLmStudio(args: {
+  systemPrompt: string;
+  userContent: string;
+  maxTokens?: number;
+  responseFormat?: "json_schema" | "text";
+}) {
+  const { baseUrl, model, apiKey } = getLmConfig();
+  const url = `${baseUrl.replace(/\/$/, "")}/v1/chat/completions`;
+
+  const body: any = {
+    model,
+    temperature: 0,
+    max_tokens: args.maxTokens ?? 1600,
+    messages: [
+      { role: "system", content: args.systemPrompt },
+      { role: "user", content: args.userContent },
+    ],
+  };
+
+  if (args.responseFormat === "json_schema") {
+    body.response_format = {
+      type: "json_schema",
+      json_schema: getAnalysisJsonSchema(),
+    };
+  } else if (args.responseFormat === "text") {
+    body.response_format = { type: "text" };
+  }
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`LM Studio error (${res.status}): ${t.slice(0, 2000)}`);
+  }
+
+  const data = (await res.json()) as any;
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content || typeof content !== "string") throw new Error("LM Studio returned empty content");
+  return { content, modelUsed: model, baseUrl };
+}
+
+// ================= Text helpers =================
+
+function cleanMedicalPolish(input: string) {
+  let s = input || "";
+
   s = s.replace(/\bnetki\b/gi, "nerki");
   s = s.replace(/\bbrusznej\b/gi, "brzusznej");
   s = s.replace(/\bbruszna\b/gi, "brzuszna");
   s = s.replace(/\bbruszny\b/gi, "brzuszny");
   s = s.replace(/\bbrusznego\b/gi, "brzusznego");
 
-  // "przeroźniona" itp.
   s = s.replace(/\bprzeroźnion([aąeęyio])\b/gi, "przerośnięt$1");
   s = s.replace(/\bprzeroźnięt([aąeęyio])\b/gi, "przerośnięt$1");
   s = s.replace(/\bprzeroźnięta\b/gi, "przerośnięta");
   s = s.replace(/\bprzeroźnięty\b/gi, "przerośnięty");
   s = s.replace(/\bprzeroźnięte\b/gi, "przerośnięte");
 
-  // "kęste osad" -> "gęsty osad" (różne końcówki)
   s = s.replace(/\bkęst([eyąa])\b/gi, "gęst$1");
 
-  // opcjonalnie: cysta/cysty -> torbiel/torbiele (jeśli wolisz)
-  // UWAGA: jeśli wolisz zostawić "cysta", zakomentuj blok poniżej
   s = s.replace(/\bcystami\b/gi, "torbielami");
   s = s.replace(/\bcystach\b/gi, "torbielach");
   s = s.replace(/\bcysty\b/gi, "torbiele");
   s = s.replace(/\bcysta\b/gi, "torbiel");
   s = s.replace(/\bcyste\b/gi, "torbiele");
 
-  // whitespace
-  s = s.replace(/\s+/g, " ").trim();
-  return s;
+  return s.replace(/\s+/g, " ").trim();
 }
 
-// ---- Quality helpers ----
+function oneLine(input: any) {
+  if (typeof input !== "string") return input;
+  return cleanMedicalPolish(input.replace(/\r?\n|\r/g, " "));
+}
+
+function ensureNullIfEmpty(v: any) {
+  if (v == null) return null;
+  if (typeof v !== "string") return v;
+  const t = oneLine(v).trim();
+  if (!t || t === "—" || t.toLowerCase() === "brak" || t.toLowerCase() === "nie dotyczy") return null;
+  return t;
+}
+
+// ================= Quality =================
+
 type TranscriptQuality = {
   score?: number;
   flags?: string[];
-  metrics?: any;
 };
 
 function getQualityBand(score: number | null) {
@@ -81,253 +201,124 @@ function getQualityBand(score: number | null) {
     };
   return {
     band: "low" as const,
-    note: "Słaba jakość transkrypcji — analiza może być istotnie niepełna. Rozważ oczyszczenie nagrania i ponowną transkrypcję.",
+    note: "Słaba jakość transkrypcji — analiza może być istotnie niepełna.",
   };
 }
 
-// ---- Prompt ----
-function buildSystemPrompt(examType: string, transcriptQualityScore: number | null, transcriptQualityFlags: string[] | null) {
-  const q = transcriptQualityScore == null ? "unknown" : String(transcriptQualityScore);
-  const flags = transcriptQualityFlags?.length ? transcriptQualityFlags.join(", ") : "none";
+// ================= Prompt =================
 
-  const qualityAddendum =
-    transcriptQualityScore != null && transcriptQualityScore < 75
+function buildSystemPrompt(examType: string, score: number | null, flags: string[] | null) {
+  const q = score == null ? "unknown" : String(score);
+  const f = flags?.length ? flags.join(", ") : "none";
+
+  const qualityRules =
+    score != null && score < 75
       ? `
-UWAGA: Jakość transkrypcji jest NISKA/ŚREDNIA (score=${q}, flags=${flags}).
-Zasady dodatkowe:
-- BĄDŹ BARDZO KONSERWATYWNY: jeśli coś nie jest jednoznacznie powiedziane w transkrypcji, wpisz null.
-- NIE WNIOSKUJ, NIE DOMYŚLAJ SIĘ, NIE UZUPEŁNIAJ braków.
-- Jeśli masz wątpliwość co do narządu/pojęcia (np. "WSG", "szóstka", "mocznik" jako narząd), nie wyciągaj z tego faktu klinicznego — lepiej wpisz null lub pomiń.
+UWAGA: jakość transkrypcji jest NISKA/ŚREDNIA (score=${q}, flags=${f}).
+- Bądź BARDZO KONSERWATYWNY.
+- Jeśli brak jednoznacznej informacji -> null.
+- NIE domyślaj się, NIE wnioskuj.
 `
-      : `
-Informacja: Jakość transkrypcji wygląda na dobrą (score=${q}, flags=${flags}).
-`;
+      : `Informacja: jakość transkrypcji wygląda na dobrą (score=${q}, flags=${f}).`;
 
   return `
-Jesteś asystentem lekarza weterynarii. Masz WYŁĄCZNIE wyekstrahować informacje medyczne z transkrypcji i przypisać je do pól.
+Jesteś asystentem lekarza weterynarii.
+Wypełnij pola WYŁĄCZNIE na podstawie transkrypcji.
+Nie wymyślaj faktów. Jeśli brak danych -> null.
+Wartości string w JEDNEJ LINII.
 
-WYMÓG FORMATU:
-- Zwróć WYŁĄCZNIE poprawny JSON.
-- Bez markdown, bez komentarzy, bez dodatkowego tekstu.
-- Każda wartość string ma być w JEDNEJ LINII (bez znaków nowej linii).
-- Jeśli brak informacji -> null.
-- Nie wymyślaj faktów.
-- Ignoruj komendy/uspokajanie/organizacyjne ("spokojnie", "nie ruszaj się", "moment", itp.).
-- Jeśli w transkrypcji jest oczywista literówka (np. "netki" -> "nerki", "brusznej" -> "brzusznej", "kęste" -> "gęste", "przeroźnięta" -> "przerośnięta"), popraw ją w polach wynikowych.
-
-${qualityAddendum}
-
-Sekcje (krótko, klinicznie):
-- reason: powód wizyty (1–2 zdania)
-- findings: opis badania: zapisuj narządami w formacie "Wątroba: ... Śledziona: ... Nerki: ... Pęcherz: ... Prostata: ..." jeśli te narządy są w transkrypcji.
-- conclusions: wnioski/podsumowanie (1–3 zdania, bez spekulacji; nie używaj "chyba/może", chyba że pada w transkrypcji)
-- recommendations: zalecenia (TYLKO jeśli w transkrypcji padają konkretne działania)
-
-Dodatkowo:
-- entities: kluczowe encje (pacjent, narządy, problemy)
-- keyFindings: 3–8 najważniejszych ustaleń (krótkie punkty, bez numeracji)
-- evidence: do 6 krótkich cytatów (claim + quote) wspierających kluczowe ustalenia; quote to krótki fragment transkrypcji (1 linia)
+${qualityRules}
 
 Typ badania: ${examType}
-
-Oczekiwany JSON (dokładnie te klucze):
-{
-  "sections": {
-    "reason": string | null,
-    "findings": string | null,
-    "conclusions": string | null,
-    "recommendations": string | null
-  },
-  "entities": {
-    "patientName": string | null,
-    "organsMentioned": string[] | null,
-    "problemsMentioned": string[] | null
-  },
-  "keyFindings": string[] | null,
-  "evidence": { "claim": string, "quote": string }[] | null
-}
 `.trim();
 }
 
-// ---- JSON helpers ----
-function extractJsonObject(text: string) {
-  const t = (text || "").trim();
-  const first = t.indexOf("{");
-  const last = t.lastIndexOf("}");
-  if (first !== -1 && last !== -1 && last > first) return t.slice(first, last + 1);
-  return t;
+function buildRetrySystemPrompt(examType: string) {
+  return `
+Popraw poprzednią odpowiedź: musisz zwrócić kompletne dane zgodne ze SCHEMATEM.
+Zwróć pełny obiekt, nie urywaj odpowiedzi.
+Bez markdown, bez komentarzy.
+Typ badania: ${examType}
+`.trim();
 }
 
-function escapeNewlinesInsideJsonStrings(input: string) {
-  let out = "";
-  let inString = false;
-  let escaped = false;
+// ================= Parse / Normalize =================
 
-  for (let i = 0; i < input.length; i++) {
-    const ch = input[i];
+function normalizeAnalysis(parsed: any) {
+  const sections = parsed?.sections || {};
+  const entities = parsed?.entities || {};
 
-    if (!inString) {
-      if (ch === '"') {
-        inString = true;
-        escaped = false;
-      }
-      out += ch;
-      continue;
-    }
-
-    if (escaped) {
-      out += ch;
-      escaped = false;
-      continue;
-    }
-
-    if (ch === "\\") {
-      out += ch;
-      escaped = true;
-      continue;
-    }
-
-    if (ch === '"') {
-      inString = false;
-      out += ch;
-      continue;
-    }
-
-    if (ch === "\n") {
-      out += "\\n";
-      continue;
-    }
-    if (ch === "\r") {
-      out += "\\r";
-      continue;
-    }
-
-    out += ch;
-  }
-
-  return out;
-}
-
-function safeJsonParse(text: string) {
-  const slice = extractJsonObject(text);
-  try {
-    return JSON.parse(slice);
-  } catch {
-    const repaired = escapeNewlinesInsideJsonStrings(slice);
-    return JSON.parse(repaired);
-  }
-}
-
-function oneLine(s: string) {
-  return s.replace(/\r?\n|\r/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function normString(v: any): string | null {
-  if (typeof v !== "string") return null;
-  return cleanMedicalPolish(oneLine(v));
-}
-
-function normArray(arr: any): string[] | null {
-  if (!Array.isArray(arr)) return null;
-  const cleaned = arr
-    .filter((x) => typeof x === "string")
-    .map((x) => cleanMedicalPolish(oneLine(x)))
-    .filter(Boolean);
-
-  const uniq = Array.from(new Set(cleaned));
-  return uniq.length ? uniq : null;
-}
-
-function normEvidence(arr: any): { claim: string; quote: string }[] | null {
-  if (!Array.isArray(arr)) return null;
-  const cleaned = arr
-    .map((x) => ({
-      claim: typeof x?.claim === "string" ? cleanMedicalPolish(oneLine(x.claim)) : null,
-      quote: typeof x?.quote === "string" ? cleanMedicalPolish(oneLine(x.quote)) : null,
-    }))
-    .filter((x) => !!x.claim && !!x.quote)
-    .slice(0, 6) as { claim: string; quote: string }[];
-
-  return cleaned.length ? cleaned : null;
-}
-
-// ---- LM calls ----
-async function callLmChat(args: {
-  baseUrl: string;
-  model: string;
-  system: string;
-  user: string;
-  maxTokens?: number;
-  temperature?: number;
-  useJsonResponseFormat?: boolean;
-}) {
-  const { baseUrl, model, system, user, maxTokens = 900, temperature = 0, useJsonResponseFormat = true } = args;
-
-  const body: any = {
-    model,
-    stream: false,
-    temperature,
-    max_tokens: maxTokens,
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ],
+  const normArr = (x: any) => {
+    if (!Array.isArray(x)) return null;
+    const cleaned = x
+      .filter((v) => typeof v === "string")
+      .map((v) => oneLine(v).trim())
+      .filter(Boolean);
+    const uniq = Array.from(new Set(cleaned));
+    return uniq.length ? uniq : null;
   };
 
-  if (useJsonResponseFormat) {
-    body.response_format = { type: "json_object" };
-  }
+  const normEvidence = (x: any) => {
+    if (!Array.isArray(x)) return null;
+    const cleaned = x
+      .map((e) => ({
+        claim: ensureNullIfEmpty(e?.claim),
+        quote: ensureNullIfEmpty(e?.quote),
+      }))
+      .filter((e) => e.claim && e.quote)
+      .slice(0, 6);
 
-  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+    return cleaned.length ? cleaned : null;
+  };
 
-  const rawText = await res.text();
-
-  if (!res.ok) {
-    return { ok: false as const, status: res.status, rawText };
-  }
-
-  let json: any = null;
-  try {
-    json = JSON.parse(rawText);
-  } catch {
-    return { ok: false as const, status: 502, rawText };
-  }
-
-  const content = json?.choices?.[0]?.message?.content;
-  return { ok: true as const, status: 200, content: typeof content === "string" ? content : "", rawText };
+  return {
+    sections: {
+      reason: ensureNullIfEmpty(sections?.reason),
+      findings: ensureNullIfEmpty(sections?.findings),
+      conclusions: ensureNullIfEmpty(sections?.conclusions),
+      recommendations: ensureNullIfEmpty(sections?.recommendations),
+    },
+    entities: {
+      patientName: ensureNullIfEmpty(entities?.patientName),
+      organsMentioned: normArr(entities?.organsMentioned),
+      problemsMentioned: normArr(entities?.problemsMentioned),
+    },
+    keyFindings: normArr(parsed?.keyFindings),
+    evidence: normEvidence(parsed?.evidence),
+  };
 }
 
-async function fixJsonWithLlm(baseUrl: string, model: string, broken: string) {
-  const system = `
-Jesteś narzędziem do naprawy danych. Dostaniesz tekst, który MA być JSON-em.
-Zwróć WYŁĄCZNIE poprawny JSON (bez markdown, bez komentarzy, bez dodatkowego tekstu).
-Nie zmieniaj znaczenia — tylko napraw format (cudzysłowy, przecinki, ucieczki znaków, domknięcia).
-`.trim();
-
-  const user = `NAPRAW TEN JSON I ZWRÓĆ POPRAWNY JSON:\n${broken}`;
-
-  const r = await callLmChat({
-    baseUrl,
-    model,
-    system,
-    user,
-    maxTokens: 1100,
-    temperature: 0,
-    useJsonResponseFormat: false,
-  });
-
-  if (!r.ok) return null;
-  return r.content?.trim() || null;
+function isAllSectionsNull(analysis: any) {
+  const s = analysis?.sections || {};
+  return !s.reason && !s.findings && !s.conclusions && !s.recommendations;
 }
 
-// ---- Route ----
+function minimalFallbackAnalysis(transcript: string, score: number | null) {
+  const note =
+    typeof score === "number" && score < 60
+      ? "Materiał niewystarczający do jednoznacznej analizy (niska jakość transkrypcji) — proszę zweryfikować opis badania."
+      : "Materiał niewystarczający do jednoznacznej analizy — proszę zweryfikować opis badania.";
+
+  return {
+    sections: {
+      reason: null,
+      findings: null,
+      conclusions: note,
+      recommendations: "W razie potrzeby powtórzyć nagranie lub uzupełnić opis badania w dokumentacji.",
+    },
+    entities: {
+      patientName: null,
+      organsMentioned: null,
+      problemsMentioned: null,
+    },
+    keyFindings: null,
+    evidence: null,
+  };
+}
+
+// ================= Endpoint =================
+
 export async function POST(req: NextRequest) {
-  const started = Date.now();
-
   try {
     const { clinicId, patientId, examId } = (await req.json()) as {
       clinicId?: string;
@@ -341,7 +332,6 @@ export async function POST(req: NextRequest) {
 
     const adminDb = await getAdminDb();
 
-    // dual-path lookup
     const refA = adminDb.doc(`patients/${patientId}/exams/${examId}`);
     const refB = clinicId ? adminDb.doc(`clinics/${clinicId}/patients/${patientId}/exams/${examId}`) : null;
 
@@ -360,166 +350,154 @@ export async function POST(req: NextRequest) {
     }
 
     const exam = snap.data() as any;
+
     const transcript: string | undefined = exam?.transcript;
-    const examType: string = (exam?.type || "Badanie").toString();
-
-    // NEW: transcript quality (optional)
-    const tq: TranscriptQuality | undefined = exam?.transcriptQuality;
-    const transcriptQualityScore: number | null =
-      typeof tq?.score === "number" && Number.isFinite(tq.score) ? tq.score : null;
-    const transcriptQualityFlags: string[] | null = Array.isArray(tq?.flags)
-      ? tq!.flags.filter((x: any) => typeof x === "string")
-      : null;
-
-    const qualityBand = getQualityBand(transcriptQualityScore);
-
-    if (!transcript || !transcript.trim()) {
-      return NextResponse.json({ error: "No transcript in exam (analyze requires transcript)" }, { status: 400 });
+    if (!transcript || !String(transcript).trim()) {
+      return NextResponse.json({ error: "Missing exam.transcript — run /api/exams/transcribe first" }, { status: 400 });
     }
 
-    const { baseUrl, model } = getLmConfig();
-    const system = buildSystemPrompt(examType, transcriptQualityScore, transcriptQualityFlags);
+    const examType = (exam?.type || "Badanie").toString();
 
-    // NEW: dodajemy kontekst jakości do user prompt (bez zmiany treści transkrypcji)
-    const qualityHeader =
-      transcriptQualityScore == null
-        ? `TRANSCRIPT_QUALITY_SCORE: unknown`
-        : `TRANSCRIPT_QUALITY_SCORE: ${transcriptQualityScore} (band=${qualityBand.band})`;
+    const tq = (exam?.transcriptQuality || {}) as TranscriptQuality;
+    const score = typeof tq?.score === "number" ? tq.score : null;
+    const flags = Array.isArray(tq?.flags) ? tq.flags : null;
+    const band = getQualityBand(score);
 
-    const user = `${qualityHeader}\nTRANSKRYPCJA:\n${transcript.trim()}`;
+    const cleanedTranscript = cleanMedicalPolish(String(transcript));
+    const systemPrompt = buildSystemPrompt(examType, score, flags);
 
-    // 1) call #1: z response_format
-    let lm = await callLmChat({
-      baseUrl,
-      model,
-      system,
-      user,
-      maxTokens: 1100,
-      temperature: 0,
-      useJsonResponseFormat: true,
+    const started = Date.now();
+
+    // 1) Primary call (json_schema)
+    let lm1 = await callLmStudio({
+      systemPrompt,
+      userContent: cleanedTranscript,
+      maxTokens: 1800,
+      responseFormat: "json_schema",
     });
 
-    // call #2: bez response_format (gdy serwer nie wspiera)
-    if (!lm.ok) {
-      lm = await callLmChat({
-        baseUrl,
-        model,
-        system,
-        user,
-        maxTokens: 1100,
-        temperature: 0,
-        useJsonResponseFormat: false,
-      });
-    }
-
-    if (!lm.ok) {
-      return NextResponse.json(
-        { error: "LM Studio error", status: lm.status, details: (lm.rawText || "").slice(0, 2000) },
-        { status: 502 }
-      );
-    }
-
-    const content = lm.content;
-    if (!content || typeof content !== "string") {
-      return NextResponse.json({ error: "LM Studio returned empty content" }, { status: 502 });
-    }
-
-    // 2) parse → jeśli nie przejdzie: spróbuj naprawić LLM-em → parse
+    let raw1 = String(lm1.content || "");
     let parsed: any = null;
-    let finalText = content;
+    let usedRetry = false;
 
     try {
-      parsed = safeJsonParse(finalText);
+      parsed = JSON.parse(raw1);
     } catch {
-      const fixed = await fixJsonWithLlm(baseUrl, model, finalText);
-      if (!fixed) {
-        return NextResponse.json(
-          { error: "Invalid JSON from LLM", rawPreview: finalText.slice(0, 2000) },
-          { status: 502 }
-        );
-      }
-      finalText = fixed;
+      // 2) Retry (json_schema) — prosimy o komplet
+      usedRetry = true;
+      const lm2 = await callLmStudio({
+        systemPrompt: buildRetrySystemPrompt(examType),
+        userContent: cleanedTranscript,
+        maxTokens: 2000,
+        responseFormat: "json_schema",
+      });
+
+      const raw2 = String(lm2.content || "");
 
       try {
-        parsed = safeJsonParse(finalText);
+        parsed = JSON.parse(raw2);
       } catch (e2: any) {
+        const tookMs = Date.now() - started;
+
+        await examRef.update({
+          analysisError: {
+            at: new Date(),
+            version: PROMPT_VERSION,
+            engine: "lmstudio",
+            baseUrl: lm1.baseUrl,
+            modelUsed: lm1.modelUsed,
+            tookMs,
+            transcriptQuality: { score, flags, band: band.band, note: band.note },
+            usedRetry,
+            parseError: String(e2?.message || e2),
+            rawModelOutputPreview: raw1.slice(0, 4000),
+            rawModelOutputRetryPreview: raw2.slice(0, 4000),
+          },
+          updatedAt: new Date(),
+        });
+
+        // Nie blokuj pipeline: zapis fallback i zwróć 200 z warningiem
+        const fallback = minimalFallbackAnalysis(String(transcript), score);
+
+        await examRef.update({
+          analysis: fallback,
+          analyzedAt: new Date(),
+          analysisMeta: {
+            version: PROMPT_VERSION,
+            engine: "lmstudio",
+            baseUrl: lm1.baseUrl,
+            modelUsed: lm1.modelUsed,
+            tookMs,
+            transcriptQuality: { score, flags, band: band.band, note: band.note },
+            fallbackUsed: true,
+            usedRetry,
+            failedJsonParse: true,
+            responseFormat: "json_schema",
+          },
+          analysisMissing: {
+            reason: !fallback.sections.reason,
+            findings: !fallback.sections.findings,
+            conclusions: !fallback.sections.conclusions,
+            recommendations: !fallback.sections.recommendations,
+          },
+          updatedAt: new Date(),
+        });
+
         return NextResponse.json(
-          { error: "Invalid JSON from LLM (after fix)", details: e2?.message, rawPreview: finalText.slice(0, 2000) },
-          { status: 502 }
+          {
+            ok: true,
+            warning: "LLM JSON parse failed; stored fallback analysis",
+            docPath: examRef.path,
+            fallbackUsed: true,
+            usedRetry,
+            quality: { score, flags, band: band.band, note: band.note },
+          },
+          { status: 200 }
         );
       }
     }
 
-    const sections = parsed?.sections ?? {};
-    const entities = parsed?.entities ?? {};
-    const keyFindings = parsed?.keyFindings ?? null;
-    const evidence = parsed?.evidence ?? null;
+    const tookMs = Date.now() - started;
 
-    const normalized = {
-      sections: {
-        reason: normString(sections.reason),
-        findings: normString(sections.findings),
-        conclusions: normString(sections.conclusions),
-        recommendations: normString(sections.recommendations),
-      },
-      entities: {
-        patientName: normString(entities.patientName),
-        organsMentioned: normArray(entities.organsMentioned),
-        problemsMentioned: normArray(entities.problemsMentioned),
-      },
-      keyFindings: normArray(keyFindings),
-      evidence: normEvidence(evidence),
-    };
+    let analysis = normalizeAnalysis(parsed);
+    let fallbackUsed = false;
 
-    const missing = {
-      reason: !normalized.sections.reason,
-      findings: !normalized.sections.findings,
-      conclusions: !normalized.sections.conclusions,
-      recommendations: !normalized.sections.recommendations,
-      keyFindings: !(normalized.keyFindings && normalized.keyFindings.length),
-      evidence: !(normalized.evidence && normalized.evidence.length),
-    };
-
-    const latencyMs = Date.now() - started;
+    if (isAllSectionsNull(analysis)) {
+      analysis = minimalFallbackAnalysis(String(transcript), score);
+      fallbackUsed = true;
+    }
 
     await examRef.update({
-      analysis: normalized,
-      analysisMissing: missing,
+      analysis,
+      analyzedAt: new Date(),
       analysisMeta: {
+        version: PROMPT_VERSION,
         engine: "lmstudio",
-        model,
-        baseUrl,
-        promptVersion: PROMPT_VERSION,
-        latencyMs,
-        analyzedAt: new Date(),
-        jsonRepaired: finalText !== content,
-
-        // NEW: quality trace
-        transcriptQualityScore,
-        transcriptQualityFlags,
-        transcriptQualityBand: qualityBand.band,
-        qualityNote: qualityBand.note,
+        baseUrl: lm1.baseUrl,
+        modelUsed: lm1.modelUsed,
+        tookMs,
+        transcriptQuality: { score, flags, band: band.band, note: band.note },
+        fallbackUsed,
+        usedRetry,
+        responseFormat: "json_schema",
       },
+      analysisMissing: {
+        reason: !analysis.sections.reason,
+        findings: !analysis.sections.findings,
+        conclusions: !analysis.sections.conclusions,
+        recommendations: !analysis.sections.recommendations,
+      },
+      updatedAt: new Date(),
     });
 
     return NextResponse.json({
       ok: true,
-      analysis: { ...normalized, missing },
-      meta: {
-        engine: "lmstudio",
-        model,
-        baseUrl,
-        promptVersion: PROMPT_VERSION,
-        latencyMs,
-        jsonRepaired: finalText !== content,
-
-        // NEW: return quality info to UI
-        transcriptQualityScore,
-        transcriptQualityFlags,
-        transcriptQualityBand: qualityBand.band,
-        qualityNote: qualityBand.note,
-      },
       docPath: examRef.path,
+      analysis,
+      quality: { score, flags, band: band.band, note: band.note },
+      tookMs,
+      fallbackUsed,
+      usedRetry,
     });
   } catch (err: any) {
     console.error("ANALYZE ERROR:", err);

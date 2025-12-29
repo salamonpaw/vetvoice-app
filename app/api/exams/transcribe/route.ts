@@ -24,9 +24,7 @@ async function getAdminDb() {
   const raw = await fs.readFile(absPath, "utf-8");
   const serviceAccount = JSON.parse(raw);
 
-  const app =
-    getApps().length > 0 ? getApps()[0] : initializeApp({ credential: cert(serviceAccount) });
-
+  const app = getApps().length > 0 ? getApps()[0] : initializeApp({ credential: cert(serviceAccount) });
   return getFirestore(app);
 }
 
@@ -67,6 +65,7 @@ function runMlxWhisperTranscribe(audioAbsPath: string): Promise<string> {
 
     child.on("close", (code) => {
       clearTimeout(timeout);
+
       const text = (stdout || "")
         .split("\n")
         .filter((line) => !line.startsWith("Args:"))
@@ -76,16 +75,13 @@ function runMlxWhisperTranscribe(audioAbsPath: string): Promise<string> {
       // PoC: jeśli stdout ma treść, uznajemy sukces nawet przy code != 0
       if (text) return resolve(text);
 
-      reject(
-        new Error(`mlx_whisper failed (code=${code}). stderr:\n${stderr}\nstdout:\n${stdout}`)
-      );
+      reject(new Error(`mlx_whisper failed (code=${code}). stderr:\n${stderr}\nstdout:\n${stdout}`));
     });
   });
 }
 
 /**
- * Część C: postprocess — usuwa typowe timestampy i porządkuje tekst.
- * Cel: transcript (czysty) + transcriptRaw (debug).
+ * Postprocess — usuwa typowe timestampy i porządkuje tekst.
  */
 function postprocessTranscript(raw: string) {
   const lines = raw
@@ -121,7 +117,7 @@ function postprocessTranscript(raw: string) {
   return cleaned.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-// ===================== Transcript quality scoring (Commit 1) =====================
+// ===================== Transcript quality scoring =====================
 
 type TranscriptQuality = {
   score: number; // 0..100
@@ -138,15 +134,6 @@ type TranscriptQuality = {
   };
 };
 
-/**
- * Minimalny, deterministyczny scoring jakości transkrypcji.
- * Cel:
- * - wykryć "szumy/bełkot" (dużo tokenów nie-słownikowych, powtórzeń),
- * - wykryć brak kluczowych narządów,
- * - dać prostą skalę pod alerty UI.
- *
- * To NIE jest ocena medyczna, tylko ocena czy tekst nadaje się jako wejście do raportu.
- */
 function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string): TranscriptQuality {
   const flags: string[] = [];
 
@@ -170,7 +157,6 @@ function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string
     };
   }
 
-  // Tokenizacja (stabilna, prosta)
   const tokens = clean
     .toLowerCase()
     .replace(/[“”„"]/g, '"')
@@ -180,7 +166,7 @@ function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string
 
   const tokenCount = tokens.length;
 
-  // 1) Powtórzenia — łagodzimy dla "uspokajaczy" (gabinet)
+  // Powtórzenia — łagodzimy dla "uspokajaczy"
   const filler = new Set([
     "spokojnie",
     "super",
@@ -201,34 +187,27 @@ function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string
 
   let repeatPairs = 0;
   let adjacentRepeats = 0;
-
   for (let i = 1; i < tokens.length; i++) {
     const prev = tokens[i - 1];
     const cur = tokens[i];
 
-    // pomijamy powtórzenia fillerów
     if (cur === prev && !filler.has(cur)) adjacentRepeats++;
-
     if (i >= 2) {
       const prev2 = tokens[i - 2];
-      if (cur === prev2 && !filler.has(cur)) repeatPairs++; // A B A
+      if (cur === prev2 && !filler.has(cur)) repeatPairs++;
     }
   }
 
-  // łagodniejsza metryka niż wcześniej (bez *2)
   const repetitionScore = Math.min(1, (adjacentRepeats + repeatPairs) / Math.max(1, tokenCount));
-
-  if (repetitionScore > 0.10) flags.push("MANY_REPETITIONS");
+  if (repetitionScore > 0.1) flags.push("MANY_REPETITIONS");
   if (repetitionScore > 0.22) flags.push("HEAVY_REPETITIONS");
 
-  // 2) Heurystyka "nie-słownikowych" tokenów (bełkot / zlepki)
+  // Heurystyka "nie-słownikowych" tokenów
   const vowels = /[aeiouyąęó]/;
   const isWeirdToken = (t: string) => {
     if (t.length <= 2) return false;
     if (t.length >= 20) return true;
-    // brak samogłoski w tokenie z literami
     if (/^\p{L}+$/u.test(t) && !vowels.test(t)) return true;
-    // podejrzane zlepki (częste w "bełkocie")
     if (/(wty|tsym|rzq|xq|qq|jjj)/.test(t)) return true;
     return false;
   };
@@ -239,15 +218,15 @@ function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string
   if (unknownTokenRatio > 0.06) flags.push("MANY_UNKNOWN_TOKENS");
   if (unknownTokenRatio > 0.12) flags.push("HEAVY_UNKNOWN_TOKENS");
 
-  // 3) Obecność kluczowych narządów (heurystyka)
+  // Obecność kluczowych narządów
   const organPatterns: Array<[string, RegExp]> = [
     ["liver", /\bwątroba\b/u],
     ["gb", /\bpęcherzyk\b[\s\S]{0,40}\bż[óo]łciow/u],
     ["spleen", /\bśledziona\b/u],
-    ["kidneys", /\bnerk[ai]|\bnerki\b/u],
+    ["kidneys", /\bnerk[ai]\b|\bnerki\b/u],
     ["bladder", /\bpęcherz\b.*\bmoczow/u],
-    ["intestines", /\bjelit\w*/u], // jelita/jelito/jelitach...
-    ["pancreas", /\btrzustk\w*/u], // trzustka/trzustki...
+    ["intestines", /\bjelit\w*/u],
+    ["pancreas", /\btrzustk\w*/u],
   ];
 
   const cleanLower = clean.toLowerCase();
@@ -257,14 +236,15 @@ function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string
   if (organHitCount <= 2) flags.push("LOW_ORGAN_COVERAGE");
   if (organHitCount <= 1) flags.push("VERY_LOW_ORGAN_COVERAGE");
 
-  // 4) Podejrzane terminy (sygnał ryzyka)
+  // Podejrzane terminy
   const suspiciousPatterns: RegExp[] = [
     /\bmocznik\s+(powiększon|wypełnion|ścian)/u,
-    /\bws?g\b/u, // WSG zamiast USG
-    /\bszóstk[ai]\b/u, // "szóstka" zamiast trzustka
+    /\bws?g\b/u,
+    /\bszóstk[ai]\b/u,
     /\bżujic\b/u,
     /\bpręg\s+żółciow/u,
   ];
+
   let suspiciousBigramCount = 0;
   for (const rx of suspiciousPatterns) {
     if (rx.test(cleanLower)) suspiciousBigramCount++;
@@ -272,14 +252,11 @@ function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string
   if (suspiciousBigramCount >= 1) flags.push("SUSPICIOUS_TERMS");
   if (suspiciousBigramCount >= 3) flags.push("MANY_SUSPICIOUS_TERMS");
 
-  // 5) Score 0..100 (ważone)
-  const organComponent = organHitRatio; // 0..1
-  const unknownComponent = 1 - Math.min(1, unknownTokenRatio * 6); // 0..1
-
-  // BYŁO: repetitionScore * 4 (za mocno)
-  const repetitionComponent = 1 - Math.min(1, repetitionScore * 2.5); // 0..1
-
-  const lengthComponent = Math.min(1, clean.length / 600); // 0..1
+  // Score
+  const organComponent = organHitRatio;
+  const unknownComponent = 1 - Math.min(1, unknownTokenRatio * 6);
+  const repetitionComponent = 1 - Math.min(1, repetitionScore * 2.5);
+  const lengthComponent = Math.min(1, clean.length / 600);
 
   const weighted =
     0.45 * organComponent +
@@ -311,21 +288,53 @@ function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string
   };
 }
 
-// ============================================================================
+// ===================== runs saved in Firestore =====================
+
+type TranscriptionRun = {
+  runId: string;
+  createdAt: Date;
+  audioSource: "raw" | "preprocessed";
+  audioPathRel: string;
+  audioAbsPath: string;
+  transcriptRaw: string;
+  transcript: string;
+  score: number;
+  flags: string[];
+  metrics: any;
+  sttMeta: any;
+};
+
+async function fileExists(p: string) {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function makeRunId(prefix: "raw" | "pre") {
+  return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+}
 
 export async function POST(req: NextRequest) {
   try {
-    const { patientId, examId } = (await req.json()) as {
+    const { patientId, examId, force, usePreprocessed } = (await req.json()) as {
       patientId?: string;
       examId?: string;
+      force?: "raw" | "auto" | "preprocessed";
+      usePreprocessed?: boolean; // compatibility
     };
 
     if (!patientId || !examId) {
       return NextResponse.json({ error: "Missing patientId or examId" }, { status: 400 });
     }
 
-    const adminDb = await getAdminDb();
+    // IMPORTANT: w tej wersji "auto" = RAW (żeby nie tracić czasu).
+    // Preprocess uruchamiasz tylko force=preprocessed albo usePreprocessed=true.
+    const mode = (usePreprocessed ? "preprocessed" : force || "auto") as "raw" | "auto" | "preprocessed";
 
+    const adminDb = await getAdminDb();
     const examRef = adminDb.doc(`patients/${patientId}/exams/${examId}`);
     const snap = await examRef.get();
 
@@ -334,51 +343,106 @@ export async function POST(req: NextRequest) {
     }
 
     const exam = snap.data() as any;
-    const localPath: string | undefined = exam?.recording?.localPath;
 
-    if (!localPath) {
-      return NextResponse.json({ error: "No recording.localPath in exam" }, { status: 400 });
+    const originalRelPath: string | undefined = exam?.recording?.localPath;
+    const preprocessedRelPath: string | undefined = exam?.recording?.preprocessedLocalPath;
+
+    if (!originalRelPath) {
+      return NextResponse.json(
+        { error: "No recording path in exam (localPath missing)" },
+        { status: 400 }
+      );
     }
 
-    const audioAbsPath = path.isAbsolute(localPath) ? localPath : path.join(process.cwd(), localPath);
+    const chosenRelPath =
+      mode === "preprocessed" && preprocessedRelPath ? preprocessedRelPath : originalRelPath;
 
-    try {
-      await fs.access(audioAbsPath);
-    } catch {
+    const audioAbsPath = path.isAbsolute(chosenRelPath)
+      ? chosenRelPath
+      : path.join(process.cwd(), chosenRelPath);
+
+    if (!(await fileExists(audioAbsPath))) {
       return NextResponse.json(
-        { error: "Audio file not found on disk", audioAbsPath, localPath },
+        { error: "Audio file not found on disk", audioAbsPath, chosenRelPath },
         { status: 404 }
       );
     }
 
-    // --- C: raw + clean ---
+    const runId = makeRunId(mode === "preprocessed" ? "pre" : "raw");
+    const t0 = Date.now();
+
     const transcriptRaw = await runMlxWhisperTranscribe(audioAbsPath);
     const transcript = postprocessTranscript(transcriptRaw);
+    const q = computeTranscriptQuality(transcript, transcriptRaw);
 
-    const transcriptQuality = computeTranscriptQuality(transcript, transcriptRaw);
-
-    await examRef.update({
+    const run: TranscriptionRun = {
+      runId,
+      createdAt: new Date(),
+      audioSource: mode === "preprocessed" ? "preprocessed" : "raw",
+      audioPathRel: chosenRelPath,
+      audioAbsPath,
       transcriptRaw,
       transcript,
+      score: q.score,
+      flags: q.flags,
+      metrics: q.metrics,
+      sttMeta: {
+        modelUsed: WHISPER_MODEL,
+        language: DEFAULT_LANGUAGE,
+        engine: "mlx-whisper",
+        transcribeMs: Date.now() - t0,
+      },
+    };
+
+    const decision =
+      mode === "preprocessed" ? "preprocess_forced" :
+      mode === "raw" ? "raw_forced" :
+      "raw_only";
+
+    const alertLevel =
+      run.score < 55 ? "critical" :
+      run.score < 65 ? "warn" :
+      run.score < 75 ? "info" :
+      "ok";
+
+    await examRef.update({
+      transcriptRaw: run.transcriptRaw,
+      transcript: run.transcript,
       transcribedAt: new Date(),
-      transcriptQuality,
+      transcriptQuality: q,
       transcriptMeta: {
         modelUsed: WHISPER_MODEL,
         language: DEFAULT_LANGUAGE,
         engine: "mlx-whisper",
-        audioLocalPath: localPath,
-        qualityScore: transcriptQuality.score,
-        qualityFlags: transcriptQuality.flags,
+        audioChosenPath: chosenRelPath,
+        audioWasPreprocessed: run.audioSource === "preprocessed",
+        qualityScore: run.score,
+        qualityFlags: run.flags,
+        decision,
+        alertLevel,
       },
+      transcription: {
+        version: "transcription-v1-lite",
+        decision,
+        activeRunId: run.runId,
+        runs: { [run.runId]: run },
+        updatedAt: new Date(),
+      },
+      updatedAt: new Date(),
     });
 
     return NextResponse.json({
       ok: true,
       patientId,
       examId,
-      transcriptPreview: transcript.slice(0, 300),
-      qualityScore: transcriptQuality.score,
-      qualityFlags: transcriptQuality.flags,
+      decision,
+      alertLevel,
+      transcriptPreview: (run.transcript || "").slice(0, 300),
+      qualityScore: run.score,
+      qualityFlags: run.flags,
+      audioUsed: run.audioPathRel,
+      audioAbsPathUsed: run.audioAbsPath,
+      audioSource: run.audioSource,
     });
   } catch (err: any) {
     console.error("TRANSCRIBE ERROR:", err);
