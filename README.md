@@ -14,6 +14,17 @@ pnpm dev
 bun dev
 ```
 
+Create a `.env.local` file with the following Firebase settings:
+
+```bash
+NEXT_PUBLIC_FIREBASE_API_KEY=your-value
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=your-value
+NEXT_PUBLIC_FIREBASE_PROJECT_ID=your-value
+NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=your-value
+NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=your-value
+NEXT_PUBLIC_FIREBASE_APP_ID=your-value
+```
+
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
