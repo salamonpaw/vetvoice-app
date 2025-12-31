@@ -15,19 +15,29 @@ const PROMPT_VERSION = "analyze-v11-json_schema-telemetry-truncation-guard";
 const MAX_LLM_INPUT_CHARS = Number(process.env.ANALYZE_MAX_INPUT_CHARS || 14000);
 
 // ================= Firebase Admin =================
+let cachedServiceAccount: Record<string, unknown> | null = null;
+let cachedDb: ReturnType<typeof getFirestore> | null = null;
 
 async function getAdminDb() {
+  if (cachedDb) return cachedDb; // cache per process (nodejs runtime)
+
   const relPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
   if (!relPath) throw new Error("Missing env FIREBASE_SERVICE_ACCOUNT_PATH (in .env.local)");
 
   const absPath = path.join(process.cwd(), relPath);
-  const raw = await fs.readFile(absPath, "utf-8");
-  const serviceAccount = JSON.parse(raw);
+  if (!cachedServiceAccount) {
+    const raw = await fs.readFile(absPath, "utf-8");
+    cachedServiceAccount = JSON.parse(raw) as Record<string, unknown>;
+  }
+  const serviceAccount = cachedServiceAccount as Parameters<typeof cert>[0];
 
   const app =
-    getApps().length > 0 ? getApps()[0] : initializeApp({ credential: cert(serviceAccount) });
+    getApps().length > 0
+      ? getApps()[0]
+      : initializeApp({ credential: cert(serviceAccount) });
 
-  return getFirestore(app);
+  cachedDb = getFirestore(app);
+  return cachedDb;
 }
 
 // ================= LM Studio =================
