@@ -3,88 +3,49 @@ export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
 import path from "path";
+import os from "os";
 import fs from "fs/promises";
+import { existsSync } from "fs";
 import { spawn } from "child_process";
+import crypto from "crypto";
 
 import { cert, getApps, initializeApp } from "firebase-admin/app";
-import { getFirestore } from "firebase-admin/firestore";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
 
-const MLX_WHISPER_BIN =
-  process.env.MLX_WHISPER_BIN || `${process.env.HOME}/Library/Python/3.9/bin/mlx_whisper`;
+/* ================== helpers ================== */
 
-const WHISPER_MODEL = process.env.WHISPER_MODEL || "mlx-community/whisper-large-v3-turbo";
-const DEFAULT_LANGUAGE = process.env.WHISPER_LANGUAGE || "pl";
-const TRANSCRIBE_TIMEOUT_MS = Number(process.env.TRANSCRIBE_TIMEOUT_MS || 5 * 60 * 1000);
-
-async function getAdminDb() {
-  const relPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
-  if (!relPath) throw new Error("Missing env FIREBASE_SERVICE_ACCOUNT_PATH (in .env.local)");
-
-  const absPath = path.join(process.cwd(), relPath);
-  const raw = await fs.readFile(absPath, "utf-8");
-  const serviceAccount = JSON.parse(raw);
-
-  const app = getApps().length > 0 ? getApps()[0] : initializeApp({ credential: cert(serviceAccount) });
-  return getFirestore(app);
+function getRequiredEnv(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env ${name}`);
+  return v;
 }
 
-function runMlxWhisperTranscribe(audioAbsPath: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const cliArgs = [
-      audioAbsPath,
-      "--task",
-      "transcribe",
-      "--model",
-      WHISPER_MODEL,
-      "--language",
-      DEFAULT_LANGUAGE,
-      "--output-format",
-      "txt",
-    ];
-
-    const child = spawn(MLX_WHISPER_BIN, cliArgs, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    const timeout = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new Error(`Transcription timeout after ${TRANSCRIBE_TIMEOUT_MS}ms`));
-    }, TRANSCRIBE_TIMEOUT_MS);
-
-    child.stdout.on("data", (d) => (stdout += d.toString()));
-    child.stderr.on("data", (d) => (stderr += d.toString()));
-
-    child.on("error", (err) => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-
-    child.on("close", (code) => {
-      clearTimeout(timeout);
-
-      const text = (stdout || "")
-        .split("\n")
-        .filter((line) => !line.startsWith("Args:"))
-        .join("\n")
-        .trim();
-
-      // PoC: jeśli stdout ma treść, uznajemy sukces nawet przy code != 0
-      if (text) return resolve(text);
-
-      reject(new Error(`mlx_whisper failed (code=${code}). stderr:\n${stderr}\nstdout:\n${stdout}`));
-    });
-  });
+function safeInt(v: string | undefined, def: number) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
 }
 
-/**
- * Postprocess — usuwa typowe timestampy i porządkuje tekst.
- */
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function preview(s: string, max = 800) {
+  const x = (s ?? "").toString();
+  return x.length <= max ? x : x.slice(0, max) + "…";
+}
+
+async function fileExists(p: string) {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Postprocess — czyści timestampy i porządkuje tekst. */
 function postprocessTranscript(raw: string) {
-  const lines = raw
+  const lines = (raw || "")
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter(Boolean);
@@ -117,7 +78,7 @@ function postprocessTranscript(raw: string) {
   return cleaned.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-// ===================== Transcript quality scoring =====================
+/* ===================== Transcript quality scoring ===================== */
 
 type TranscriptQuality = {
   score: number; // 0..100
@@ -166,23 +127,8 @@ function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string
 
   const tokenCount = tokens.length;
 
-  // Powtórzenia — łagodzimy dla "uspokajaczy"
   const filler = new Set([
-    "spokojnie",
-    "super",
-    "dobrze",
-    "tak",
-    "no",
-    "witam",
-    "już",
-    "chwila",
-    "ok",
-    "idealnie",
-    "proszę",
-    "leżymy",
-    "leż",
-    "ładnie",
-    "brawo",
+    "spokojnie","super","dobrze","tak","no","witam","już","chwila","ok","idealnie","proszę","leżymy","leż","ładnie","brawo",
   ]);
 
   let repeatPairs = 0;
@@ -190,7 +136,6 @@ function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string
   for (let i = 1; i < tokens.length; i++) {
     const prev = tokens[i - 1];
     const cur = tokens[i];
-
     if (cur === prev && !filler.has(cur)) adjacentRepeats++;
     if (i >= 2) {
       const prev2 = tokens[i - 2];
@@ -202,7 +147,6 @@ function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string
   if (repetitionScore > 0.1) flags.push("MANY_REPETITIONS");
   if (repetitionScore > 0.22) flags.push("HEAVY_REPETITIONS");
 
-  // Heurystyka "nie-słownikowych" tokenów
   const vowels = /[aeiouyąęó]/;
   const isWeirdToken = (t: string) => {
     if (t.length <= 2) return false;
@@ -218,7 +162,6 @@ function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string
   if (unknownTokenRatio > 0.06) flags.push("MANY_UNKNOWN_TOKENS");
   if (unknownTokenRatio > 0.12) flags.push("HEAVY_UNKNOWN_TOKENS");
 
-  // Obecność kluczowych narządów
   const organPatterns: Array<[string, RegExp]> = [
     ["liver", /\bwątroba\b/u],
     ["gb", /\bpęcherzyk\b[\s\S]{0,40}\bż[óo]łciow/u],
@@ -236,7 +179,6 @@ function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string
   if (organHitCount <= 2) flags.push("LOW_ORGAN_COVERAGE");
   if (organHitCount <= 1) flags.push("VERY_LOW_ORGAN_COVERAGE");
 
-  // Podejrzane terminy
   const suspiciousPatterns: RegExp[] = [
     /\bmocznik\s+(powiększon|wypełnion|ścian)/u,
     /\bws?g\b/u,
@@ -252,7 +194,6 @@ function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string
   if (suspiciousBigramCount >= 1) flags.push("SUSPICIOUS_TERMS");
   if (suspiciousBigramCount >= 3) flags.push("MANY_SUSPICIOUS_TERMS");
 
-  // Score
   const organComponent = organHitRatio;
   const unknownComponent = 1 - Math.min(1, unknownTokenRatio * 6);
   const repetitionComponent = 1 - Math.min(1, repetitionScore * 2.5);
@@ -288,164 +229,261 @@ function computeTranscriptQuality(transcriptClean: string, transcriptRaw: string
   };
 }
 
-// ===================== runs saved in Firestore =====================
+/* ================== firebase ================== */
 
-type TranscriptionRun = {
-  runId: string;
-  createdAt: Date;
-  audioSource: "raw" | "preprocessed";
-  audioPathRel: string;
-  audioAbsPath: string;
-  transcriptRaw: string;
-  transcript: string;
-  score: number;
-  flags: string[];
-  metrics: any;
-  sttMeta: any;
-};
-
-async function fileExists(p: string) {
-  try {
-    await fs.access(p);
-    return true;
-  } catch {
-    return false;
+async function getAdminDb() {
+  if (!getApps().length) {
+    const relPath = getRequiredEnv("FIREBASE_SERVICE_ACCOUNT_PATH");
+    const abs = path.isAbsolute(relPath) ? relPath : path.join(process.cwd(), relPath);
+    const json = JSON.parse(await fs.readFile(abs, "utf8"));
+    initializeApp({ credential: cert(json) });
   }
+  return getFirestore();
 }
 
-function makeRunId(prefix: "raw" | "pre") {
-  return `${prefix}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-}
+/* ================== route ================== */
 
 export async function POST(req: NextRequest) {
-  try {
-    const { patientId, examId, force, usePreprocessed } = (await req.json()) as {
-      patientId?: string;
-      examId?: string;
-      force?: "raw" | "auto" | "preprocessed";
-      usePreprocessed?: boolean; // compatibility
-    };
+  const runId = crypto.randomUUID();
+  const startedAt = nowIso();
 
-    if (!patientId || !examId) {
-      return NextResponse.json({ error: "Missing patientId or examId" }, { status: 400 });
+  try {
+    const body = await req.json();
+
+    let patientId = (body.patientId ?? "").toString().trim();
+    let examId = (body.examId ?? "").toString().trim();
+    const docPath = (body.docPath ?? "").toString().trim();
+    const force = (body.force ?? "auto").toString().trim() as "raw" | "auto" | "preprocessed";
+
+    if (docPath) {
+      const m = docPath.match(/^patients\/([^/]+)\/exams\/([^/]+)$/);
+      if (!m) {
+        return NextResponse.json(
+          { ok: false, error: "Invalid docPath format. Expected patients/{pid}/exams/{eid}" },
+          { status: 400 }
+        );
+      }
+      patientId = m[1];
+      examId = m[2];
     }
 
-    // IMPORTANT: w tej wersji "auto" = RAW (żeby nie tracić czasu).
-    // Preprocess uruchamiasz tylko force=preprocessed albo usePreprocessed=true.
-    const mode = (usePreprocessed ? "preprocessed" : force || "auto") as "raw" | "auto" | "preprocessed";
+    if (!patientId || !examId) {
+      return NextResponse.json({ ok: false, error: "Missing patientId or examId" }, { status: 400 });
+    }
 
-    const adminDb = await getAdminDb();
-    const examRef = adminDb.doc(`patients/${patientId}/exams/${examId}`);
+    const db = await getAdminDb();
+    const examRefPath = `patients/${patientId}/exams/${examId}`;
+    const examRef = db.doc(examRefPath);
     const snap = await examRef.get();
 
     if (!snap.exists) {
-      return NextResponse.json({ error: "Exam not found" }, { status: 404 });
+      return NextResponse.json({ ok: false, error: "Exam not found", examRefPath }, { status: 404 });
     }
 
     const exam = snap.data() as any;
 
-    const originalRelPath: string | undefined = exam?.recording?.localPath;
-    const preprocessedRelPath: string | undefined = exam?.recording?.preprocessedLocalPath;
+    const recording = exam.recording || {};
+    const originalRelPath: string | undefined = recording.localPath;
+    const preprocessedRelPath: string | undefined = recording.preprocessedLocalPath;
 
     if (!originalRelPath) {
-      return NextResponse.json(
-        { error: "No recording path in exam (localPath missing)" },
-        { status: 400 }
-      );
+      return NextResponse.json({ ok: false, error: "Missing recording.localPath", examRefPath }, { status: 400 });
     }
 
-    const chosenRelPath =
-      mode === "preprocessed" && preprocessedRelPath ? preprocessedRelPath : originalRelPath;
+    const mode =
+      force === "preprocessed" && preprocessedRelPath ? "preprocessed" :
+      force === "raw" ? "raw" :
+      "raw";
 
-    const audioAbsPath = path.isAbsolute(chosenRelPath)
-      ? chosenRelPath
-      : path.join(process.cwd(), chosenRelPath);
+    const chosenRelPath = mode === "preprocessed" ? preprocessedRelPath! : originalRelPath;
+    const audioAbsPath = path.isAbsolute(chosenRelPath) ? chosenRelPath : path.join(process.cwd(), chosenRelPath);
 
-    if (!(await fileExists(audioAbsPath))) {
+    if (!(await fileExists(audioAbsPath)) || !existsSync(audioAbsPath)) {
       return NextResponse.json(
-        { error: "Audio file not found on disk", audioAbsPath, chosenRelPath },
+        { ok: false, error: "Audio file not found on disk", audioAbsPath, chosenRelPath, examRefPath },
         { status: 404 }
       );
     }
 
-    const runId = makeRunId(mode === "preprocessed" ? "pre" : "raw");
-    const t0 = Date.now();
+    const MLX = getRequiredEnv("MLX_WHISPER_BIN");
+    const MODEL = getRequiredEnv("WHISPER_MODEL");
+    const LANG = (process.env.WHISPER_LANGUAGE || "pl").toString();
+    const TIMEOUT_MS = safeInt(process.env.TRANSCRIBE_TIMEOUT_MS, 480_000);
+    const BEST_OF = safeInt(process.env.TRANSCRIBE_BEST_OF, 3);
+    const TEMPERATURE = 0;
 
-    const transcriptRaw = await runMlxWhisperTranscribe(audioAbsPath);
+    const tmpDir = path.join(os.tmpdir(), `vetvoice-stt-${examId}-${runId}`);
+    await fs.mkdir(tmpDir, { recursive: true });
+
+    const args = [
+      audioAbsPath,
+      "--task","transcribe",
+      "--model", MODEL,
+      "--language", LANG,
+      "--output-format","txt",
+      "--output-dir", tmpDir,
+      "--temperature", String(TEMPERATURE),
+      "--best-of", String(BEST_OF),
+    ];
+
+    let stdout = "";
+    let stderr = "";
+
+    const child = spawn(MLX, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        HF_HUB_OFFLINE: "1",
+        TRANSFORMERS_OFFLINE: "1",
+        HF_DATASETS_OFFLINE: "1",
+      },
+    });
+
+    child.stdout?.on("data", (d) => (stdout += d.toString()));
+    child.stderr?.on("data", (d) => (stderr += d.toString()));
+
+    const exit = await Promise.race([
+      new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((res) =>
+        child.on("close", (code, signal) => res({ code, signal }))
+      ),
+      new Promise<{ code: null; signal: "SIGKILL" }>((res) =>
+        setTimeout(() => {
+          try { child.kill("SIGKILL"); } catch {}
+          res({ code: null, signal: "SIGKILL" });
+        }, TIMEOUT_MS)
+      ),
+    ]);
+
+    const finishedAt = nowIso();
+    const durationMs = new Date(finishedAt).getTime() - new Date(startedAt).getTime();
+
+    const files = await fs.readdir(tmpDir).catch(() => []);
+    const txt = files.find((f) => f.endsWith(".txt"));
+
+    if (!txt) {
+      // zapisz run info jako błąd
+      await examRef.update({
+        transcriptError: {
+          at: nowIso(),
+          message: "No transcript produced",
+          exitCode: exit.code,
+          signal: exit.signal,
+          stderrPreview: preview(stderr, 1600),
+          stdoutPreview: preview(stdout, 800),
+        },
+        transcriptMeta: {
+          lastRunId: runId,
+          lastRunAt: nowIso(),
+          model: MODEL,
+          language: LANG,
+          temperature: TEMPERATURE,
+          bestOf: BEST_OF,
+          offline: true,
+          bin: MLX,
+          audioChosenPath: chosenRelPath,
+          audioWasPreprocessed: mode === "preprocessed",
+          durationMs,
+        },
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "No transcript produced",
+          exitCode: exit.code,
+          signal: exit.signal,
+          stderr: preview(stderr, 1800),
+          stdout: preview(stdout, 900),
+        },
+        { status: 500 }
+      );
+    }
+
+    const transcriptRaw = (await fs.readFile(path.join(tmpDir, txt), "utf8")).toString().trim();
     const transcript = postprocessTranscript(transcriptRaw);
     const q = computeTranscriptQuality(transcript, transcriptRaw);
 
-    const run: TranscriptionRun = {
-      runId,
-      createdAt: new Date(),
-      audioSource: mode === "preprocessed" ? "preprocessed" : "raw",
-      audioPathRel: chosenRelPath,
-      audioAbsPath,
-      transcriptRaw,
-      transcript,
-      score: q.score,
-      flags: q.flags,
-      metrics: q.metrics,
-      sttMeta: {
-        modelUsed: WHISPER_MODEL,
-        language: DEFAULT_LANGUAGE,
-        engine: "mlx-whisper",
-        transcribeMs: Date.now() - t0,
-      },
-    };
-
-    const decision =
-      mode === "preprocessed" ? "preprocess_forced" :
-      mode === "raw" ? "raw_forced" :
-      "raw_only";
+    // sprzątanie (best effort)
+    fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
 
     const alertLevel =
-      run.score < 55 ? "critical" :
-      run.score < 65 ? "warn" :
-      run.score < 75 ? "info" :
+      q.score < 55 ? "critical" :
+      q.score < 65 ? "warn" :
+      q.score < 75 ? "info" :
       "ok";
 
     await examRef.update({
-      transcriptRaw: run.transcriptRaw,
-      transcript: run.transcript,
+      transcriptRaw,
+      transcript,
       transcribedAt: new Date(),
       transcriptQuality: q,
       transcriptMeta: {
-        modelUsed: WHISPER_MODEL,
-        language: DEFAULT_LANGUAGE,
-        engine: "mlx-whisper",
+        lastRunId: runId,
+        lastRunAt: nowIso(),
+        model: MODEL,
+        language: LANG,
+        temperature: TEMPERATURE,
+        bestOf: BEST_OF,
+        offline: true,
+        bin: MLX,
         audioChosenPath: chosenRelPath,
-        audioWasPreprocessed: run.audioSource === "preprocessed",
-        qualityScore: run.score,
-        qualityFlags: run.flags,
-        decision,
+        audioWasPreprocessed: mode === "preprocessed",
+        qualityScore: q.score,
+        qualityFlags: q.flags,
         alertLevel,
+        durationMs,
       },
-      transcription: {
-        version: "transcription-v1-lite",
-        decision,
-        activeRunId: run.runId,
-        runs: { [run.runId]: run },
-        updatedAt: new Date(),
-      },
-      updatedAt: new Date(),
+      // historia uruchomień — prosto i bez ryzyka nadpisania
+      transcriptRuns: FieldValue.arrayUnion({
+        runId,
+        at: startedAt,
+        finishedAt,
+        durationMs,
+        audioSource: mode,
+        audioPathRel: chosenRelPath,
+        audioAbsPath,
+        model: MODEL,
+        language: LANG,
+        temperature: TEMPERATURE,
+        bestOf: BEST_OF,
+        offline: true,
+        exitCode: exit.code,
+        signal: exit.signal,
+        stderrPreview: preview(stderr, 900),
+        stdoutPreview: preview(stdout, 600),
+        score: q.score,
+        flags: q.flags,
+        metrics: q.metrics,
+        transcriptRawChars: transcriptRaw.length,
+        transcriptChars: transcript.length,
+      }),
+      updatedAt: FieldValue.serverTimestamp(),
     });
 
     return NextResponse.json({
       ok: true,
       patientId,
       examId,
-      decision,
+      audioUsed: chosenRelPath,
+      audioSource: mode,
+      transcriptPreview: preview(transcript, 900),
+      qualityScore: q.score,
+      qualityFlags: q.flags,
       alertLevel,
-      transcriptPreview: (run.transcript || "").slice(0, 300),
-      qualityScore: run.score,
-      qualityFlags: run.flags,
-      audioUsed: run.audioPathRel,
-      audioAbsPathUsed: run.audioAbsPath,
-      audioSource: run.audioSource,
+      sttMeta: {
+        runId,
+        model: MODEL,
+        language: LANG,
+        durationMs,
+        offline: true,
+        stderrPreview: preview(stderr, 600),
+      },
     });
-  } catch (err: any) {
-    console.error("TRANSCRIBE ERROR:", err);
-    return NextResponse.json({ error: err?.message || "Unknown error" }, { status: 500 });
+  } catch (e: any) {
+    return NextResponse.json(
+      { ok: false, error: e?.message || "Unknown error", name: e?.name || "Error" },
+      { status: 500 }
+    );
   }
 }

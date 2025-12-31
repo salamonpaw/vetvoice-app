@@ -8,7 +8,11 @@ import fs from "fs/promises";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 
-const PROMPT_VERSION = "analyze-v10-json_schema-response_format-retry-fallback";
+const PROMPT_VERSION = "analyze-v11-json_schema-telemetry-truncation-guard";
+
+// Guard: limit długości wejścia do LLM (żeby nie zabić kontekstu).
+// To NIE zmienia transkrypcji w bazie — tylko to, co wysyłamy do LLM.
+const MAX_LLM_INPUT_CHARS = Number(process.env.ANALYZE_MAX_INPUT_CHARS || 14000);
 
 // ================= Firebase Admin =================
 
@@ -36,8 +40,6 @@ function getLmConfig() {
 }
 
 function getAnalysisJsonSchema() {
-  // JSON Schema (Draft 2020-12-ish). LM Studio wymaga type=json_schema.
-  // Trzymamy proste typy i nullable przez anyOf.
   const nullableString = { anyOf: [{ type: "string" }, { type: "null" }] };
   const nullableStringArray = {
     anyOf: [{ type: "array", items: { type: "string" } }, { type: "null" }],
@@ -107,7 +109,7 @@ async function callLmStudio(args: {
   const body: any = {
     model,
     temperature: 0,
-    max_tokens: args.maxTokens ?? 1600,
+    max_tokens: args.maxTokens ?? 5000,
     messages: [
       { role: "system", content: args.systemPrompt },
       { role: "user", content: args.userContent },
@@ -132,15 +134,33 @@ async function callLmStudio(args: {
     body: JSON.stringify(body),
   });
 
+  const rawText = await res.text();
+
   if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`LM Studio error (${res.status}): ${t.slice(0, 2000)}`);
+    throw new Error(`LM Studio error (${res.status}): ${rawText.slice(0, 2000)}`);
   }
 
-  const data = (await res.json()) as any;
+  // LM Studio zwraca JSON w stylu OpenAI; parsujemy tu, żeby wyciągnąć finish_reason/usage.
+  let data: any;
+  try {
+    data = JSON.parse(rawText);
+  } catch (e: any) {
+    throw new Error(`LM Studio returned non-JSON response: ${String(e?.message || e)}. Preview: ${rawText.slice(0, 500)}`);
+  }
+
   const content = data?.choices?.[0]?.message?.content;
   if (!content || typeof content !== "string") throw new Error("LM Studio returned empty content");
-  return { content, modelUsed: model, baseUrl };
+
+  const finishReason = data?.choices?.[0]?.finish_reason ?? null;
+  const usage = data?.usage ?? null;
+
+  return {
+    content,
+    modelUsed: model,
+    baseUrl,
+    finishReason,
+    usage,
+  };
 }
 
 // ================= Text helpers =================
@@ -182,6 +202,25 @@ function ensureNullIfEmpty(v: any) {
   const t = oneLine(v).trim();
   if (!t || t === "—" || t.toLowerCase() === "brak" || t.toLowerCase() === "nie dotyczy") return null;
   return t;
+}
+
+function truncateForLlm(text: string) {
+  const t = text || "";
+  if (t.length <= MAX_LLM_INPUT_CHARS) {
+    return { text: t, truncated: false, originalChars: t.length, sentChars: t.length };
+  }
+  const head = t.slice(0, Math.floor(MAX_LLM_INPUT_CHARS * 0.7));
+  const tail = t.slice(-Math.floor(MAX_LLM_INPUT_CHARS * 0.3));
+  const merged =
+    `${head}\n\n[... UCIĘTO ŚRODEK TRANSKRYPCJI (dla limitu kontekstu) ...]\n\n${tail}`;
+  return { text: merged, truncated: true, originalChars: t.length, sentChars: merged.length };
+}
+
+function seemsTruncatedByFinishReason(finishReason: any) {
+  // typowe w OpenAI: "stop" / "length" / "content_filter"
+  if (!finishReason) return false;
+  if (typeof finishReason !== "string") return false;
+  return finishReason !== "stop";
 }
 
 // ================= Quality =================
@@ -226,6 +265,7 @@ Jesteś asystentem lekarza weterynarii.
 Wypełnij pola WYŁĄCZNIE na podstawie transkrypcji.
 Nie wymyślaj faktów. Jeśli brak danych -> null.
 Wartości string w JEDNEJ LINII.
+Zwróć WYŁĄCZNIE JSON zgodny ze schematem (bez markdown i komentarzy).
 
 ${qualityRules}
 
@@ -351,9 +391,12 @@ export async function POST(req: NextRequest) {
 
     const exam = snap.data() as any;
 
-    const transcript: string | undefined = exam?.transcript;
+    const transcript: string | undefined = exam?.transcriptNormalized || exam?.transcript;
     if (!transcript || !String(transcript).trim()) {
-      return NextResponse.json({ error: "Missing exam.transcript — run /api/exams/transcribe first" }, { status: 400 });
+      return NextResponse.json(
+        { error: "Missing exam.transcript — run /api/exams/transcribe first" },
+        { status: 400 }
+      );
     }
 
     const examType = (exam?.type || "Badanie").toString();
@@ -364,21 +407,26 @@ export async function POST(req: NextRequest) {
     const band = getQualityBand(score);
 
     const cleanedTranscript = cleanMedicalPolish(String(transcript));
+    const lim = truncateForLlm(cleanedTranscript);
+
     const systemPrompt = buildSystemPrompt(examType, score, flags);
 
     const started = Date.now();
 
     // 1) Primary call (json_schema)
-    let lm1 = await callLmStudio({
+    const lm1 = await callLmStudio({
       systemPrompt,
-      userContent: cleanedTranscript,
-      maxTokens: 1800,
+      userContent: lim.text,
+      maxTokens: 4500,
       responseFormat: "json_schema",
     });
 
-    let raw1 = String(lm1.content || "");
+    const raw1 = String(lm1.content || "");
     let parsed: any = null;
     let usedRetry = false;
+
+    // telemetry: czy model uciął wyjście
+    const truncatedOut1 = seemsTruncatedByFinishReason(lm1.finishReason);
 
     try {
       parsed = JSON.parse(raw1);
@@ -387,12 +435,13 @@ export async function POST(req: NextRequest) {
       usedRetry = true;
       const lm2 = await callLmStudio({
         systemPrompt: buildRetrySystemPrompt(examType),
-        userContent: cleanedTranscript,
-        maxTokens: 2000,
+        userContent: lim.text,
+        maxTokens: 3000,
         responseFormat: "json_schema",
       });
 
       const raw2 = String(lm2.content || "");
+      const truncatedOut2 = seemsTruncatedByFinishReason(lm2.finishReason);
 
       try {
         parsed = JSON.parse(raw2);
@@ -412,6 +461,16 @@ export async function POST(req: NextRequest) {
             parseError: String(e2?.message || e2),
             rawModelOutputPreview: raw1.slice(0, 4000),
             rawModelOutputRetryPreview: raw2.slice(0, 4000),
+            lmTelemetry: {
+              primary: { finishReason: lm1.finishReason, usage: lm1.usage, truncatedOut: truncatedOut1 },
+              retry: { finishReason: lm2.finishReason, usage: lm2.usage, truncatedOut: truncatedOut2 },
+            },
+            llmInput: {
+              truncatedIn: lim.truncated,
+              originalChars: lim.originalChars,
+              sentChars: lim.sentChars,
+              maxChars: MAX_LLM_INPUT_CHARS,
+            },
           },
           updatedAt: new Date(),
         });
@@ -433,6 +492,17 @@ export async function POST(req: NextRequest) {
             usedRetry,
             failedJsonParse: true,
             responseFormat: "json_schema",
+            truncated: true,
+            lmTelemetry: {
+              primary: { finishReason: lm1.finishReason, usage: lm1.usage, truncatedOut: truncatedOut1 },
+              retry: { finishReason: lm2.finishReason, usage: lm2.usage, truncatedOut: truncatedOut2 },
+            },
+            llmInput: {
+              truncatedIn: lim.truncated,
+              originalChars: lim.originalChars,
+              sentChars: lim.sentChars,
+              maxChars: MAX_LLM_INPUT_CHARS,
+            },
           },
           analysisMissing: {
             reason: !fallback.sections.reason,
@@ -455,17 +525,80 @@ export async function POST(req: NextRequest) {
           { status: 200 }
         );
       }
+
+      // jeśli retry się udał, to podmień telemetrię na retry
+      // (zachowujemy lm1 do meta, ale parsed jest z retry)
+      const tookMs = Date.now() - started;
+      let analysis = normalizeAnalysis(parsed);
+      let fallbackUsed = false;
+
+      const allNull = isAllSectionsNull(analysis);
+      if (allNull) {
+        analysis = minimalFallbackAnalysis(String(transcript), score);
+        fallbackUsed = true;
+      }
+
+      const truncatedFinal =
+        lim.truncated || truncatedOut1 || truncatedOut2 || allNull;
+
+      await examRef.update({
+        analysis,
+        analyzedAt: new Date(),
+        analysisMeta: {
+          version: PROMPT_VERSION,
+          engine: "lmstudio",
+          baseUrl: lm1.baseUrl,
+          modelUsed: lm1.modelUsed,
+          tookMs,
+          transcriptQuality: { score, flags, band: band.band, note: band.note },
+          fallbackUsed,
+          usedRetry,
+          responseFormat: "json_schema",
+          truncated: truncatedFinal,
+          lmTelemetry: {
+            primary: { finishReason: lm1.finishReason, usage: lm1.usage, truncatedOut: truncatedOut1 },
+            retry: { finishReason: "retry", usage: null, truncatedOut: truncatedOut2 }, // retry usage jest w lm2, ale nie przechowujemy całego obiektu (opcjonalnie możesz)
+          },
+          llmInput: {
+            truncatedIn: lim.truncated,
+            originalChars: lim.originalChars,
+            sentChars: lim.sentChars,
+            maxChars: MAX_LLM_INPUT_CHARS,
+          },
+        },
+        analysisMissing: {
+          reason: !analysis.sections.reason,
+          findings: !analysis.sections.findings,
+          conclusions: !analysis.sections.conclusions,
+          recommendations: !analysis.sections.recommendations,
+        },
+        updatedAt: new Date(),
+      });
+
+      return NextResponse.json({
+        ok: true,
+        docPath: examRef.path,
+        analysis,
+        quality: { score, flags, band: band.band, note: band.note },
+        tookMs,
+        fallbackUsed,
+        usedRetry,
+      });
     }
 
+    // primary parse succeeded
     const tookMs = Date.now() - started;
 
     let analysis = normalizeAnalysis(parsed);
     let fallbackUsed = false;
 
-    if (isAllSectionsNull(analysis)) {
+    const allNull = isAllSectionsNull(analysis);
+    if (allNull) {
       analysis = minimalFallbackAnalysis(String(transcript), score);
       fallbackUsed = true;
     }
+
+    const truncatedFinal = lim.truncated || truncatedOut1 || allNull;
 
     await examRef.update({
       analysis,
@@ -480,6 +613,16 @@ export async function POST(req: NextRequest) {
         fallbackUsed,
         usedRetry,
         responseFormat: "json_schema",
+        truncated: truncatedFinal,
+        lmTelemetry: {
+          primary: { finishReason: lm1.finishReason, usage: lm1.usage, truncatedOut: truncatedOut1 },
+        },
+        llmInput: {
+          truncatedIn: lim.truncated,
+          originalChars: lim.originalChars,
+          sentChars: lim.sentChars,
+          maxChars: MAX_LLM_INPUT_CHARS,
+        },
       },
       analysisMissing: {
         reason: !analysis.sections.reason,
