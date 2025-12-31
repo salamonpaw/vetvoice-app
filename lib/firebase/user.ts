@@ -4,6 +4,8 @@ import { onAuthStateChanged, User } from "firebase/auth";
 
 export const USER_TS_VERSION = "2025-12-14-FINAL-FIX";
 
+let cachedClinicId: string | null = null;
+
 function waitForAuthUser(timeoutMs = 8000): Promise<User> {
   return new Promise((resolve, reject) => {
     const unsub = onAuthStateChanged(
@@ -48,12 +50,17 @@ async function ensureUser(uid: string) {
   return ref;
 }
 
-export async function getMyClinicId(): Promise<string> {
+export async function getMyClinicId(options: { refresh?: boolean } = {}): Promise<string> {
+  if (!options.refresh && cachedClinicId) {
+    return cachedClinicId;
+  }
+
   const user = auth.currentUser ?? (await waitForAuthUser());
   const ref = await ensureUser(user.uid);
   const snap = await getDoc(ref);
 
   const data = snap.data() as any;
-  return data?.clinicId ?? "demo-clinic";
+  const clinicId = data?.clinicId ?? "demo-clinic";
+  cachedClinicId = clinicId;
+  return clinicId;
 }
-
