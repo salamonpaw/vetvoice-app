@@ -9,9 +9,29 @@ import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 
 const PROMPT_VERSION =
-  "facts-v9-preprocess-dictionary+loop-protection+anamnesis-reason+logiclayer-wall-shadow+findings-lines+conditions-dotkeys+drop-empty-keys";
+  "facts-v9.1-p071-firestore-undefined-fix+preprocess-dictionary+loop-protection+anamnesis-reason+logiclayer-wall-shadow+findings-lines+conditions-dotkeys+drop-empty-keys";
 const MAX_LLM_INPUT_CHARS = Number(process.env.FACTS_MAX_INPUT_CHARS || 12000);
 const LM_TIMEOUT_MS = Number(process.env.FACTS_LM_TIMEOUT_MS || 60000);
+
+/* ================= Firestore: strip undefined ================= */
+
+function stripUndefinedDeep<T>(obj: T): T {
+  if (Array.isArray(obj)) {
+    // keep order, remove explicit undefined items
+    return obj.map(stripUndefinedDeep).filter((v) => v !== undefined) as any;
+  }
+  if (obj && typeof obj === "object") {
+    const out: any = {};
+    for (const [k, v] of Object.entries(obj as any)) {
+      if (v === undefined) continue;
+      const vv = stripUndefinedDeep(v);
+      if (vv === undefined) continue;
+      out[k] = vv;
+    }
+    return out;
+  }
+  return obj;
+}
 
 /* ================= Vet Dictionary (STT → Medical) ================= */
 
@@ -31,7 +51,6 @@ export const VET_STT_DICTIONARY: Array<[string, string]> = [
   ["wiejniki", "jajniki"],
   ["wieżniki", "jajniki"],
 
-  // częsty fonetyczny zjazd
   ["szóstka", "trzustka"],
 
   ["aksiserpa", "akcja serca"],
@@ -55,18 +74,24 @@ export const VET_STT_DICTIONARY: Array<[string, string]> = [
 
   ["miąż", "miąższ"],
   ["koraj", "kora"],
+
   ["cieniak użytkowy", "cień akustyczny"],
   ["cieniek użytkowy", "cień akustyczny"],
+
   ["węzły kręskowe", "węzły krezkowe"],
   ["węzły kręskowy", "węzły krezkowe"],
+
   ["jelita, czego stwierdzam", "jelita, gdzie stwierdzam"],
+
   ["wywiatował", "zwymiotował"],
   ["wywiatowała", "zwymiotowała"],
+
   ["pęcherzyk żujciowy", "pęcherzyk żółciowy"],
 
+  // z Twoich testów: STT czasem robi totalny odjazd przy nerkach
+  ["prątnica pachwina", "nerki"],
 
-  // “nierka/nierki” są w tabeli u Ciebie jako “ortograficzne”,
-  // ale to nie jest realny błąd – zostawiamy bez mapowania, żeby nie psuć innych form fleksyjnych.
+  // “nierka/nierki” nie mapujemy – to realne słowa i mogą występować poprawnie
 ];
 
 function escapeRegex(s: string) {
@@ -75,8 +100,6 @@ function escapeRegex(s: string) {
 
 /**
  * Deterministyczna korekta STT: zamiany fonetyczne/ortograficzne.
- * - Nie robi diagnoz.
- * - Nie zmienia znaczenia poza mapowaniami.
  */
 export function applyVetDictionary(text: string) {
   const applied: Array<{ from: string; to: string; count: number }> = [];
@@ -106,25 +129,17 @@ function normalizeLoopKey(s: string) {
     .trim();
 }
 
-/**
- * Usuwa zapętlenia STT:
- * - jeśli identyczna fraza powtarza się > maxRepeats razy, zostawia maxKeep, usuwa resztę.
- * - działa na liniach; jeśli transkrypcja jest "ciągła", i tak łapie powtarzane zdania,
- *   bo Whisper zwykle wstawia te same segmenty jako osobne linie / zdania.
- */
 export function removeLoops(text: string, opts?: { maxRepeats?: number; keep?: number }) {
   const maxRepeats = opts?.maxRepeats ?? 3;
   const keep = opts?.keep ?? 1;
 
-  // rozbijamy na linie, ale jeśli ktoś ma transkrypcję w 1 linii, to i tak pomoże:
-  // - dodatkowo splitujemy po ". " gdy linia jest bardzo długa i zawiera powtórzenia.
   const rawLines = String(text || "")
     .split(/\r?\n/)
     .flatMap((l) => {
       const line = l.trim();
       if (!line) return [];
-      // heurystyka: jeśli linia jest ekstremalnie długa, tniemy po kropkach
-      if (line.length > 400 && line.includes(". ")) return line.split(/(?<=\.)\s+/).map((x) => x.trim());
+      if (line.length > 400 && line.includes(". "))
+        return line.split(/(?<=\.)\s+/).map((x) => x.trim());
       return [line];
     })
     .filter(Boolean);
@@ -150,7 +165,6 @@ export function removeLoops(text: string, opts?: { maxRepeats?: number; keep?: n
       continue;
     }
 
-    // w pierwszych maxRepeats zostawiamy normalnie
     outLines.push(line);
   }
 
@@ -164,24 +178,51 @@ export function removeLoops(text: string, opts?: { maxRepeats?: number; keep?: n
 }
 
 const OWNER_REASON_PATTERNS: Array<{ id: string; re: RegExp; label: string }> = [
-  { id: "hematuria", re: /\bsika\s+krwi(?:ą|a)?\b|\bkrew\s+w\s+moczu\b|\bkrwiomocz\b/i, label: "krwiomocz / sikanie krwią" },
-  { id: "vomiting", re: /(?:wymiot(?:uje|y|ował|owała|y?my)|zwymiot(?:ował|owała|uje|y|ali|ały))/i, label: "wymioty" },
+  {
+    id: "hematuria",
+    re: /\bsika\s+krwi(?:ą|a)?\b|\bkrew\s+w\s+moczu\b|\bkrwiomocz\b/i,
+    label: "krwiomocz / sikanie krwią",
+  },
+  {
+    // FIX: tu musi być normalne \b, a nie niewidzialny znak backspace
+    id: "vomiting",
+    re: /\b(?:wymiot(?:uje|y|ował|owała|y?my)|zwymiot(?:ował|owała|uje|y|ali|ały))\b/i,
+    label: "wymioty",
+  },
   { id: "diarrhea", re: /\bbiegunka\b|\bluzne?\s+kup(?:y|a)\b/i, label: "biegunka" },
   { id: "anorexia", re: /\bnie\s+je\b|\bbrak\s+apetytu\b/i, label: "brak apetytu / nie je" },
-  { id: "polydipsia", re: /\bdużo\s+pije\b|\bwzmożone\s+pragnienie\b/i, label: "wzmożone pragnienie (dużo pije)" },
-  { id: "polyuria", re: /\bdużo\s+sika\b|\bczęsto\s+sika\b|\bwielomocz\b/i, label: "wielomocz / częste oddawanie moczu" },
-  { id: "abdominal_pain", re: /\bboli\s+brzuch\b|\bbolesno(?:ść|sci)\b|\bnapina\s+brzuch\b/i, label: "ból brzucha / bolesność" },
-  { id: "lethargy", re: /\bosowiały\b|\bapatyczny\b|\bbez\s+energii\b/i, label: "osowiałość / apatia" },
-  { id: "weight_loss", re: /\bchudn(?:ie|iecie)\b|\butrat(?:a|y)\s+masy\b/i, label: "chudnięcie / utrata masy" },
+  {
+    id: "polydipsia",
+    re: /\bdużo\s+pije\b|\bwzmożone\s+pragnienie\b/i,
+    label: "wzmożone pragnienie (dużo pije)",
+  },
+  {
+    id: "polyuria",
+    re: /\bdużo\s+sika\b|\bczęsto\s+sika\b|\bwielomocz\b/i,
+    label: "wielomocz / częste oddawanie moczu",
+  },
+  {
+    id: "abdominal_pain",
+    re: /\bboli\s+brzuch\b|\bbolesno(?:ść|sci)\b|\bnapina\s+brzuch\b/i,
+    label: "ból brzucha / bolesność",
+  },
+  // poszerzamy o „apatyczna / zgaszona” (Saba)
+  {
+    id: "lethargy",
+    re: /\bosowiały\b|\bapatyczna\b|\bapatyczny\b|\bzgaszona\b|\bbez\s+energii\b/i,
+    label: "osowiałość / apatia",
+  },
+  {
+    id: "weight_loss",
+    re: /\bchudn(?:ie|iecie)\b|\butrat(?:a|y)\s+masy\b/i,
+    label: "chudnięcie / utrata masy",
+  },
 ];
 
-/**
- * Intencja: powód wizyty z wypowiedzi właściciela (anamneza).
- * Bez diagnoz, bez interpretacji: tylko wykrycie fraz-kluczy.
- */
 export function extractPatientNameCandidate(text: string) {
-  // Heurystyka: łapiemy imię tylko w formach grzecznościowych, żeby uniknąć fałszywych trafień.
-  // Przykłady: "Witam Pana Maxa", "Panie Maxiu".
+  // Uwaga: historycznie łapaliśmy imię z form grzecznościowych ("Panie Maxiu"),
+  // ale to potrafi wyłapać właściciela ("Panie Piotrze, proszę...").
+  // Minimalny bezpiecznik: jeśli po "Panie X" zaraz jest "proszę" → to najpewniej właściciel.
   const candidates: string[] = [];
 
   const patterns: RegExp[] = [
@@ -194,15 +235,20 @@ export function extractPatientNameCandidate(text: string) {
   for (const re of patterns) {
     let m: RegExpExecArray | null;
     while ((m = re.exec(text))) {
-      if (m[1]) candidates.push(m[1]);
+      const name = m[1];
+      if (!name) continue;
+
+      // owner-guard: "Panie Piotrze, proszę ..." -> skip
+      const tail = text.slice(m.index, Math.min(text.length, m.index + 80)).toLowerCase();
+      if (tail.includes("proszę")) continue;
+
+      candidates.push(name);
     }
   }
 
   const raw = candidates.length ? candidates[0] : null;
   if (!raw) return { raw: null, normalized: null };
 
-  // Minimalna normalizacja odmiany (np. "Maxa" -> "Max").
-  // Robimy to ostrożnie: tylko jeśli kończy się na "a" i poprzednia litera to spółgłoska.
   let normalized = raw;
   const lower = raw.toLowerCase();
   const vowels = ["a", "e", "i", "o", "u", "y", "ą", "ę", "ó"];
@@ -211,9 +257,7 @@ export function extractPatientNameCandidate(text: string) {
     if (!vowels.includes(prev)) normalized = raw.slice(0, -1);
   }
 
-  // Wersalizacja pierwszej litery (na wypadek dziwnych wejść)
   normalized = normalized.charAt(0).toUpperCase() + normalized.slice(1);
-
   return { raw, normalized };
 }
 
@@ -223,9 +267,25 @@ function extractReasonCandidate(text: string) {
     if (p.re.test(text)) hits.push({ id: p.id, label: p.label });
   }
   const unique = Array.from(new Map(hits.map((h) => [h.id, h])).values());
+
+  // P0.7: wolisz zdanie z transkrypcji niż listę etykiet — ale nie robimy tu rewolucji.
+  // Minimalnie: jeśli znajdziemy linię zawierającą objaw, to ją bierzemy.
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .flatMap((l) => (l.includes(". ") ? l.split(/(?<=\.)\s+/) : [l]))
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  const reasonLine =
+    lines.find((l) => OWNER_REASON_PATTERNS.some((p) => p.re.test(l))) || null;
+
+  const reason =
+    reasonLine?.replace(/\s+/g, " ").trim().replace(/[.。]\s*$/g, "") ||
+    (unique.length ? unique.map((h) => h.label).join("; ") : null);
+
   return {
     hits: unique,
-    reason: unique.length ? unique.map((h) => h.label).join("; ") : null,
+    reason: reason || null,
   };
 }
 
@@ -246,7 +306,6 @@ export function preprocessTranscript(transcriptRaw: string) {
     patientNameRaw: name.raw,
   };
 }
-
 
 /* ================= Logic Layer (P0.5) ================= */
 
@@ -284,11 +343,6 @@ function parseFindingLine(line: string) {
   return { organ, desc };
 }
 
-/**
- * Reguła 1: "ściana" tylko dla narządów pustych.
- * Działamy deterministycznie na findings (liniach "Narząd: opis").
- * - Jeśli wykryjemy "ścian" i organ NIE jest pusty → odrzucamy linię + log.
- */
 function enforceWallAssignment(findingsLines: string[]) {
   const kept: string[] = [];
   const rejected: LogicRejection[] = [];
@@ -316,16 +370,11 @@ function enforceWallAssignment(findingsLines: string[]) {
       reason:
         'Wykryto "ścian(…)" przy narządzie miąższowym. Reguła: ściana tylko dla narządów pustych.',
     });
-    // drop line
   }
 
   return { kept, rejected };
 }
 
-/**
- * Reguła 2: "cień akustyczny" powinien współwystępować z kamieniem/złogiem itd.
- * - Tu nie przepisujemy faktów (bo mogło paść samo "cień"), ale logujemy ostrzeżenie.
- */
 function detectAcousticShadow(findingsLines: string[]) {
   const warnings: LogicRejection[] = [];
 
@@ -349,11 +398,6 @@ function detectAcousticShadow(findingsLines: string[]) {
   return warnings;
 }
 
-/**
- * P0.5: Logic layer na facts (po normalizacji do lines).
- * - wall_assignment: drop invalid lines
- * - acoustic_shadow: log warning
- */
 export function enforceLogicLayerOnFacts(facts: any) {
   const findingsLines: string[] = Array.isArray(facts?.findingsLines)
     ? facts.findingsLines
@@ -364,12 +408,10 @@ export function enforceLogicLayerOnFacts(facts: any) {
   const wall = enforceWallAssignment(findingsLines);
   const shadowWarnings = detectAcousticShadow(wall.kept);
 
-  // update facts in-place to keep pipeline stable
   facts.findingsLines = wall.kept;
   facts.findings = wall.kept;
 
   const rejections = [...wall.rejected, ...shadowWarnings];
-
   return { facts, logicRejections: rejections };
 }
 
@@ -388,7 +430,13 @@ async function getAdminDb() {
       ? getApps()[0]
       : initializeApp({ credential: cert(serviceAccount) });
 
-  return getFirestore(app);
+  const db = getFirestore(app);
+
+  // ✅ Pas bezpieczeństwa: Firestore ignoruje undefined
+  // (i tak stripujemy undefined głębiej, ale to łapie edge-case’y)
+  db.settings({ ignoreUndefinedProperties: true });
+
+  return db;
 }
 
 /* ================= LM Studio ================= */
@@ -428,7 +476,7 @@ WYMAGANE POLA:
 4) measurements: tablica (OBOWIĄZKOWE)
    - Każdy element:
      { structure: string, location: string|null, value: number[], unit: string, meta?: object }
-   - value ZAWSZE tablica liczb (np. [4.5,3.2] lub [104,105])
+   - value ZAWSZE tablica liczb
    - Jeśli nie da się zachować formatu → measurements = []
 
 Jeżeli pojawi się inny język niż polski — zwróć {}.`;
@@ -520,10 +568,6 @@ function uniqTrim(lines: string[]): string[] {
   return out;
 }
 
-/**
- * Usuwa linie typu "limitations:" / "xyz:" (klucz bez wartości).
- * To jest deterministyczne i nie zmienia treści merytorycznej.
- */
 function dropEmptyKeyOnly(lines: string[]): string[] {
   return lines.filter((l) => {
     const s = String(l ?? "").trim();
@@ -533,8 +577,47 @@ function dropEmptyKeyOnly(lines: string[]): string[] {
   });
 }
 
+/**
+ * ✅ P0.7.1: stabilna normalizacja measurements
+ * - usuwa śmieci
+ * - nie dopuszcza undefined w polach
+ * - meta dodaje TYLKO jeśli jest prawidłowym obiektem
+ */
 function normalizeMeasurements(input: any): any[] {
-  return Array.isArray(input) ? input : [];
+  if (!Array.isArray(input)) return [];
+
+  const out: any[] = [];
+
+  for (const m of input) {
+    if (!m || typeof m !== "object") continue;
+
+    const structure = typeof m.structure === "string" ? m.structure.trim() : "";
+    const location =
+      typeof m.location === "string" && m.location.trim() ? m.location.trim() : null;
+    const unit = typeof m.unit === "string" ? m.unit.trim() : "";
+
+    const rawValue: unknown[] = Array.isArray(m.value) ? (m.value as unknown[]) : [];
+    const value: number[] = rawValue
+      .map((x: unknown) => (typeof x === "number" && Number.isFinite(x) ? x : null))
+      .filter((x): x is number => x !== null);
+
+
+    if (!structure) continue;
+    if (!unit) continue;
+    if (!value.length) continue;
+
+    const item: any = { structure, location, value, unit };
+
+    if (m.meta && typeof m.meta === "object" && !Array.isArray(m.meta)) {
+      item.meta = stripUndefinedDeep(m.meta);
+      // jeśli meta po stripowaniu jest puste, omit
+      if (item.meta && Object.keys(item.meta).length === 0) delete item.meta;
+    }
+
+    out.push(item);
+  }
+
+  return out;
 }
 
 // Zbiera klucze typu "conditions.sedation" -> { sedation: ... }
@@ -610,7 +693,6 @@ function normalizeToLines(input: any, opts?: { includeKeys?: boolean }): string[
 }
 
 function normalizeFactsForReport(facts: any) {
-  // conditions — preferuj obiekt, ale wspieraj dot-keys
   let conditionsObj: any = facts?.conditions;
   if (!conditionsObj && isPlainObject(facts)) {
     const dot = collectDotKeys(facts, "conditions");
@@ -620,7 +702,6 @@ function normalizeFactsForReport(facts: any) {
 
   const conditionsLines = normalizeToLines(conditionsObj, { includeKeys: true });
 
-  // findings — wymagane jako string[]
   const srcFindings =
     facts?.findings ??
     facts?.findingsByOrgan ??
@@ -629,7 +710,6 @@ function normalizeFactsForReport(facts: any) {
 
   const findingsLines = normalizeToLines(srcFindings, { includeKeys: true });
 
-  // zapis dla report generatora
   facts.conditions = conditionsLines;
   facts.findings = findingsLines;
   facts.conditionsLines = conditionsLines;
@@ -683,7 +763,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "No transcript on exam" }, { status: 400 });
     }
 
-    // === P0.5: preprocess BEFORE extract-facts ===
+    // preprocess BEFORE extract-facts
     const pre = preprocessTranscript(transcriptRaw);
     const transcriptPreprocessed = pre.text;
 
@@ -722,70 +802,71 @@ export async function POST(req: NextRequest) {
     // normalizacja pod report
     facts = normalizeFactsForReport(facts);
 
-// P0.6: reason + imię pacjenta z preprocessingu (deterministycznie)
-try {
-  if (!facts.exam || typeof facts.exam !== "object") facts.exam = {};
-  if (pre.reasonCandidate && !facts.exam.reason) facts.exam.reason = pre.reasonCandidate;
-  if (pre.patientNameCandidate && !facts.exam.patientName) facts.exam.patientName = pre.patientNameCandidate;
-} catch {}
+    // P0.6: reason + imię pacjenta z preprocessingu (deterministycznie)
+    try {
+      if (!facts.exam || typeof facts.exam !== "object") facts.exam = {};
+      if (pre.reasonCandidate && !facts.exam.reason) facts.exam.reason = pre.reasonCandidate;
+      if (pre.patientNameCandidate && !facts.exam.patientName)
+        facts.exam.patientName = pre.patientNameCandidate;
+    } catch {}
 
-
-    // === P0.5: anamneza → powód wizyty (deterministycznie, bez halucynacji) ===
+    // anamneza → powód wizyty (deterministycznie, bez halucynacji)
     if (!facts.exam || typeof facts.exam !== "object") facts.exam = {};
     if (!facts.exam.reason && pre.reasonCandidate) {
       facts.exam.reason = pre.reasonCandidate;
     }
-    // zachowujemy też jako osobne pole (wygodne dla raportu / debug)
     if (!facts.reason && pre.reasonCandidate) {
       facts.reason = pre.reasonCandidate;
     }
 
-
-    // === P0.5: logic layer after normalization ===
+    // logic layer after normalization
     const logic = enforceLogicLayerOnFacts(facts);
 
-    // LOGI: każde odrzucenie reguły (dla Twoich "Max/Toffi" case)
     for (const r of logic.logicRejections) {
       console.warn(
         `[vetvoice][extract-facts][logic:${r.rule}] organ=${r.organ ?? "-"} reason=${r.reason} finding=${r.finding ?? "-"}`
       );
     }
 
-    // zapis do Firestore (facts = snapshot dla tego egzaminu)
-    await examRef.update({
-      facts: logic.facts,
-      factsMeta: {
-        at: new Date(),
-        version: PROMPT_VERSION,
-        modelUsed: lm.modelUsed,
-        baseUrl: lm.baseUrl,
-        tookMs: lm.tookMs,
-
-        preprocess: {
-          ...pre,
-          inputChars: input.length,
-        },
-
-        logicLayer: {
-          rejections: logic.logicRejections,
-          rejectionsCount: logic.logicRejections.length,
-        },
-
-        normalized: true,
-        normalizedFields: [
-          "facts.findings",
-          "facts.conditions",
-          "facts.findingsLines",
-          "facts.conditionsLines",
-        ],
+    // ✅ Firestore-safe: strip undefined everywhere
+    const factsClean = stripUndefinedDeep(logic.facts);
+    const factsMetaClean = stripUndefinedDeep({
+      at: new Date(),
+      version: PROMPT_VERSION,
+      modelUsed: lm.modelUsed,
+      baseUrl: lm.baseUrl,
+      tookMs: lm.tookMs,
+      preprocess: {
+        ...pre,
+        inputChars: input.length,
       },
+      logicLayer: {
+        rejections: logic.logicRejections,
+        rejectionsCount: logic.logicRejections.length,
+      },
+      normalized: true,
+      normalizedFields: [
+        "facts.findings",
+        "facts.conditions",
+        "facts.findingsLines",
+        "facts.conditionsLines",
+      ],
+    });
+
+    await examRef.update({
+      facts: factsClean,
+      factsMeta: factsMetaClean,
     });
 
     return NextResponse.json({
       ok: true,
       docPath: examRef.path,
-      facts: logic.facts,
-      preprocess: { dictionaryApplied: pre.dictionaryApplied, loopsRemoved: pre.loopsRemoved, reasonCandidate: pre.reasonCandidate },
+      facts: factsClean,
+      preprocess: {
+        dictionaryApplied: pre.dictionaryApplied,
+        loopsRemoved: pre.loopsRemoved,
+        reasonCandidate: pre.reasonCandidate,
+      },
       logicLayer: { rejections: logic.logicRejections },
       tookMs: lm.tookMs,
     });
