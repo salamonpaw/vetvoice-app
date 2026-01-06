@@ -8,10 +8,9 @@ import fs from "fs/promises";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 
-const PROMPT_VERSION = "analyze-v13-facts-first-timeout60s-softfail-save";
+const PROMPT_VERSION = "analyze-v12-json_schema-telemetry-truncation-guard-cjk-filter";
 
-const MAX_LLM_INPUT_CHARS = Number(process.env.ANALYZE_MAX_INPUT_CHARS || 9000); // mniejsze = szybciej
-const LM_TIMEOUT_MS = Number(process.env.ANALYZE_LM_TIMEOUT_MS || 60000); // twarde 60s
+const MAX_LLM_INPUT_CHARS = Number(process.env.ANALYZE_MAX_INPUT_CHARS || 14000);
 
 // ================= Error helpers =================
 
@@ -27,11 +26,6 @@ function safeErrorMessage(err: unknown) {
   } catch {
     return "Unknown error";
   }
-}
-
-function isTimeoutErrorMessage(msg: string) {
-  const m = (msg || "").toLowerCase();
-  return m.includes("timeout") || m.includes("timed out") || m.includes("aborted") || m.includes("abort");
 }
 
 // ================= Language / garbage guards =================
@@ -57,7 +51,9 @@ function sanitizeStringPolishOnly(v: any) {
   const stripped = stripCjk(v);
   const cleaned = stripped.replace(/\s+/g, " ").trim();
 
+  // jeśli po usunięciu CJK nic sensownego nie zostało
   if (!cleaned || cleaned === "—") return { value: null, changed: true, hadCjk: true };
+
   return { value: cleaned, changed: true, hadCjk: true };
 }
 
@@ -167,7 +163,6 @@ async function callLmStudio(args: {
   userContent: string;
   maxTokens?: number;
   responseFormat?: "json_schema" | "text";
-  timeoutMs?: number;
 }) {
   const { baseUrl, model, apiKey } = getLmConfig();
   const url = `${baseUrl.replace(/\/$/, "")}/v1/chat/completions`;
@@ -175,7 +170,7 @@ async function callLmStudio(args: {
   const body: any = {
     model,
     temperature: 0,
-    max_tokens: args.maxTokens ?? 1600, // mniejsze = szybciej
+    max_tokens: args.maxTokens ?? 5000,
     messages: [
       { role: "system", content: args.systemPrompt },
       { role: "user", content: args.userContent },
@@ -191,55 +186,43 @@ async function callLmStudio(args: {
     body.response_format = { type: "text" };
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), args.timeoutMs ?? LM_TIMEOUT_MS);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
 
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+  const rawText = await res.text();
 
-    const rawText = await res.text();
-
-    if (!res.ok) {
-      throw new Error(`LM Studio error (${res.status}): ${rawText.slice(0, 2000)}`);
-    }
-
-    let data: any;
-    try {
-      data = JSON.parse(rawText);
-    } catch (e: any) {
-      throw new Error(
-        `LM Studio returned non-JSON response: ${String(e?.message || e)}. Preview: ${rawText.slice(0, 500)}`
-      );
-    }
-
-    const content = data?.choices?.[0]?.message?.content;
-    if (!content || typeof content !== "string") throw new Error("LM Studio returned empty content");
-
-    const finishReason = data?.choices?.[0]?.finish_reason ?? null;
-    const usage = data?.usage ?? null;
-
-    return {
-      content,
-      modelUsed: model,
-      baseUrl,
-      finishReason,
-      usage,
-    };
-  } catch (e: any) {
-    // AbortController -> ujednolicamy komunikat
-    const msg = String(e?.name === "AbortError" ? `LM Studio timeout (${args.timeoutMs ?? LM_TIMEOUT_MS}ms)` : e?.message || e);
-    throw new Error(msg);
-  } finally {
-    clearTimeout(timeout);
+  if (!res.ok) {
+    throw new Error(`LM Studio error (${res.status}): ${rawText.slice(0, 2000)}`);
   }
+
+  let data: any;
+  try {
+    data = JSON.parse(rawText);
+  } catch (e: any) {
+    throw new Error(
+      `LM Studio returned non-JSON response: ${String(e?.message || e)}. Preview: ${rawText.slice(0, 500)}`
+    );
+  }
+
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content || typeof content !== "string") throw new Error("LM Studio returned empty content");
+
+  const finishReason = data?.choices?.[0]?.finish_reason ?? null;
+  const usage = data?.usage ?? null;
+
+  return {
+    content,
+    modelUsed: model,
+    baseUrl,
+    finishReason,
+    usage,
+  };
 }
 
 // ================= Text helpers =================
@@ -283,34 +266,15 @@ function ensureNullIfEmpty(v: any) {
   return t;
 }
 
-// szybciej niż head+tail: preferujemy fragmenty z liczbami i słowami kluczowymi
-function extractSalientTranscript(text: string) {
-  const t = (text || "").replace(/\r/g, "\n");
-  const lines = t.split("\n").map((x) => x.trim()).filter(Boolean);
-
-  const strongRe =
-    /(cm|mm|%|\btemperatur|\btętno|\boddech|\bpęcherz|\bmacic|\bjajnik|\bnerk|\bwątro|\bjelit|\btrzustk|\bśledzion|\bwolny płyn|\bcien akust|\bcialo obc|\bpiometr|\bropomacic|\bzachyłek|\bhiper|anecho|hypocho|\bunaczyn|pogrubien|zatarta warstw|perystaltyk|niedrożn|poszerzon)/i;
-
-  const selected: string[] = [];
-  for (const ln of lines) {
-    if (strongRe.test(ln) || /\d/.test(ln)) selected.push(ln);
-    if (selected.join("\n").length >= MAX_LLM_INPUT_CHARS) break;
+function truncateForLlm(text: string) {
+  const t = text || "";
+  if (t.length <= MAX_LLM_INPUT_CHARS) {
+    return { text: t, truncated: false, originalChars: t.length, sentChars: t.length };
   }
-
-  // fallback: jeśli selekcja pusta, weź head+tail
-  if (!selected.length) {
-    const cleaned = (text || "").slice(0, MAX_LLM_INPUT_CHARS);
-    return { text: cleaned, truncated: (text || "").length > cleaned.length, mode: "head" as const };
-  }
-
-  let out = selected.join("\n");
-  if (out.length > MAX_LLM_INPUT_CHARS) out = out.slice(0, MAX_LLM_INPUT_CHARS);
-
-  return {
-    text: out,
-    truncated: (text || "").length > out.length,
-    mode: "salient" as const,
-  };
+  const head = t.slice(0, Math.floor(MAX_LLM_INPUT_CHARS * 0.7));
+  const tail = t.slice(-Math.floor(MAX_LLM_INPUT_CHARS * 0.3));
+  const merged = `${head}\n\n[... UCIĘTO ŚRODEK TRANSKRYPCJI (dla limitu kontekstu) ...]\n\n${tail}`;
+  return { text: merged, truncated: true, originalChars: t.length, sentChars: merged.length };
 }
 
 function seemsTruncatedByFinishReason(finishReason: any) {
@@ -350,25 +314,20 @@ function buildSystemPrompt(examType: string, score: number | null, flags: string
     score != null && score < 75
       ? `
 UWAGA: jakość transkrypcji jest NISKA/ŚREDNIA (score=${q}, flags=${f}).
-- Nadal: NIE wymyślaj faktów.
-- Ale: WYŁAP wszystko, co jest jednoznacznie powiedziane (zwłaszcza liczby, wymiary, organy, rozpoznania, objawy).
+- Bądź BARDZO KONSERWATYWNY.
 - Jeśli brak jednoznacznej informacji -> null.
+- NIE domyślaj się, NIE wnioskuj.
 `
       : `Informacja: jakość transkrypcji wygląda na dobrą (score=${q}, flags=${f}).`;
 
   return `
 Jesteś asystentem lekarza weterynarii.
-Twoje zadanie: wydobądź FAKTY z transkrypcji i uzupełnij pola WYŁĄCZNIE na podstawie transkrypcji.
-Nie dodawaj nic od siebie. Jeśli brak danych -> null.
-Wartości string w JEDNEJ LINII (bez nowych linii).
+Wypełnij pola WYŁĄCZNIE na podstawie transkrypcji.
+Nie wymyślaj faktów. Jeśli brak danych -> null.
+Wartości string w JEDNEJ LINII.
 Odpowiedzi ZAWSZE po polsku.
 Nie używaj żadnego innego języka.
 Zwróć WYŁĄCZNIE JSON zgodny ze schematem (bez markdown i komentarzy).
-
-DODATKOWE ZASADY:
-- Sekcja "reason" ma uwzględniać objawy/wywiad, jeśli są w rozmowie (np. apatia, polidypsja, czas od cieczki).
-- "keyFindings" ma być listą 5-12 najważniejszych faktów klinicznych (krótkie, medyczne).
-- "evidence": 3-6 wpisów claim+quote. Quote to krótki cytat z transkrypcji (max ~140 znaków), który potwierdza claim.
 
 ${qualityRules}
 
@@ -446,6 +405,7 @@ function sanitizeAnalysisPolishOnly(analysis: any) {
   const pm = sanitizeStringArrayPolishOnly(analysis?.entities?.problemsMentioned);
   const kf = sanitizeStringArrayPolishOnly(analysis?.keyFindings);
 
+  // evidence: claim/quote
   let evidenceChanged = false;
   let evidenceHadCjk = false;
   let evidenceOut: any = null;
@@ -563,156 +523,78 @@ export async function POST(req: NextRequest) {
     const flags = Array.isArray(tq?.flags) ? tq.flags : null;
     const band = getQualityBand(score);
 
-    // ważne: zachowujemy poprzednią analizę, jeśli istnieje
-    const existingAnalysis = exam?.analysis || null;
-    const hasExistingSections = !!existingAnalysis?.sections;
-
     const cleanedTranscript = cleanMedicalPolish(String(transcript));
-    const salient = extractSalientTranscript(cleanedTranscript);
+    const lim = truncateForLlm(cleanedTranscript);
 
     const systemPrompt = buildSystemPrompt(examType, score, flags);
 
     const started = Date.now();
 
+    // 1) Primary call (json_schema)
+    const lm1 = await callLmStudio({
+      systemPrompt,
+      userContent: lim.text,
+      maxTokens: 4500,
+      responseFormat: "json_schema",
+    });
+
+    const raw1 = String(lm1.content || "");
+    let parsed: any = null;
+    let usedRetry = false;
+
+    const truncatedOut1 = seemsTruncatedByFinishReason(lm1.finishReason);
+
     try {
-      // 1) Primary call (json_schema)
-      const lm1 = await callLmStudio({
-        systemPrompt,
-        userContent: salient.text,
-        maxTokens: 1600,
+      parsed = JSON.parse(raw1);
+    } catch {
+      usedRetry = true;
+
+      const lm2 = await callLmStudio({
+        systemPrompt: buildRetrySystemPrompt(examType),
+        userContent: lim.text,
+        maxTokens: 3000,
         responseFormat: "json_schema",
-        timeoutMs: LM_TIMEOUT_MS,
       });
 
-      const raw1 = String(lm1.content || "");
-      let parsed: any = null;
-      let usedRetry = false;
-
-      const truncatedOut1 = seemsTruncatedByFinishReason(lm1.finishReason);
+      const raw2 = String(lm2.content || "");
+      const truncatedOut2 = seemsTruncatedByFinishReason(lm2.finishReason);
 
       try {
-        parsed = JSON.parse(raw1);
-      } catch {
-        usedRetry = true;
-
-        const lm2 = await callLmStudio({
-          systemPrompt: buildRetrySystemPrompt(examType),
-          userContent: salient.text,
-          maxTokens: 1400,
-          responseFormat: "json_schema",
-          timeoutMs: LM_TIMEOUT_MS,
-        });
-
-        const raw2 = String(lm2.content || "");
-        const truncatedOut2 = seemsTruncatedByFinishReason(lm2.finishReason);
-
-        try {
-          parsed = JSON.parse(raw2);
-        } catch (e2: any) {
-          const tookMs = Date.now() - started;
-
-          // ❗ nie kończymy 500 bez zapisu: zapisujemy meta + fallback (lub zostawiamy stare)
-          const fallback = minimalFallbackAnalysis(String(transcript), score);
-
-          await examRef.update({
-            analysisError: {
-              at: new Date(),
-              version: PROMPT_VERSION,
-              engine: "lmstudio",
-              modelUsed: lm1.modelUsed,
-              baseUrl: lm1.baseUrl,
-              tookMs,
-              transcriptQuality: { score, flags, band: band.band, note: band.note },
-              usedRetry,
-              parseError: String(e2?.message || e2),
-              rawModelOutputPreview: raw1.slice(0, 2500),
-              rawModelOutputRetryPreview: raw2.slice(0, 2500),
-              llmTelemetry: {
-                primary: { finishReason: lm1.finishReason, usage: lm1.usage, truncatedOut: truncatedOut1 },
-                retry: { finishReason: lm2.finishReason, usage: lm2.usage, truncatedOut: truncatedOut2 },
-              },
-              llmInput: {
-                mode: salient.mode,
-                truncatedIn: salient.truncated,
-                sentChars: salient.text.length,
-                maxChars: MAX_LLM_INPUT_CHARS,
-              },
-            },
-            ...(hasExistingSections
-              ? {
-                  analysisMeta: {
-                    ...(exam?.analysisMeta || {}),
-                    version: PROMPT_VERSION,
-                    warning: "LLM JSON parse failed; kept existing analysis",
-                    keptExisting: true,
-                    failedJsonParse: true,
-                    tookMs,
-                  },
-                }
-              : {
-                  analysis: fallback,
-                  analyzedAt: new Date(),
-                  analysisMeta: {
-                    version: PROMPT_VERSION,
-                    engine: "lmstudio",
-                    baseUrl: lm1.baseUrl,
-                    modelUsed: lm1.modelUsed,
-                    tookMs,
-                    transcriptQuality: { score, flags, band: band.band, note: band.note },
-                    fallbackUsed: true,
-                    usedRetry,
-                    failedJsonParse: true,
-                    responseFormat: "json_schema",
-                    llmInput: {
-                      mode: salient.mode,
-                      truncatedIn: salient.truncated,
-                      sentChars: salient.text.length,
-                      maxChars: MAX_LLM_INPUT_CHARS,
-                    },
-                  },
-                  analysisMissing: {
-                    reason: !fallback.sections.reason,
-                    findings: !fallback.sections.findings,
-                    conclusions: !fallback.sections.conclusions,
-                    recommendations: !fallback.sections.recommendations,
-                  },
-                }),
-            updatedAt: new Date(),
-          });
-
-          return NextResponse.json(
-            {
-              ok: true,
-              warning: hasExistingSections
-                ? "LLM JSON parse failed; kept existing analysis"
-                : "LLM JSON parse failed; stored fallback analysis",
-              docPath: examRef.path,
-              keptExisting: !!hasExistingSections,
-              fallbackUsed: !hasExistingSections,
-              usedRetry,
-            },
-            { status: 200 }
-          );
-        }
-
-        // retry succeeded -> normal flow
+        parsed = JSON.parse(raw2);
+      } catch (e2: any) {
         const tookMs = Date.now() - started;
 
-        let analysis = normalizeAnalysis(parsed);
-        const sres = sanitizeAnalysisPolishOnly(analysis);
-        analysis = sres.sanitized;
+        await examRef.update({
+          analysisError: {
+            at: new Date(),
+            version: PROMPT_VERSION,
+            engine: "lmstudio",
+            baseUrl: lm1.baseUrl,
+            modelUsed: lm1.modelUsed,
+            tookMs,
+            transcriptQuality: { score, flags, band: band.band, note: band.note },
+            usedRetry,
+            parseError: String(e2?.message || e2),
+            rawModelOutputPreview: raw1.slice(0, 4000),
+            rawModelOutputRetryPreview: raw2.slice(0, 4000),
+            lmTelemetry: {
+              primary: { finishReason: lm1.finishReason, usage: lm1.usage, truncatedOut: truncatedOut1 },
+              retry: { finishReason: lm2.finishReason, usage: lm2.usage, truncatedOut: truncatedOut2 },
+            },
+            llmInput: {
+              truncatedIn: lim.truncated,
+              originalChars: lim.originalChars,
+              sentChars: lim.sentChars,
+              maxChars: MAX_LLM_INPUT_CHARS,
+            },
+          },
+          updatedAt: new Date(),
+        });
 
-        let fallbackUsed = false;
-        const allNull = isAllSectionsNull(analysis);
-        if (allNull) {
-          analysis = minimalFallbackAnalysis(String(transcript), score);
-          fallbackUsed = true;
-        }
-
-        const truncatedFinal = salient.truncated || truncatedOut1 || truncatedOut2 || allNull;
+        const fallback = minimalFallbackAnalysis(String(transcript), score);
 
         await examRef.update({
-          analysis,
+          analysis: fallback,
           analyzedAt: new Date(),
           analysisMeta: {
             version: PROMPT_VERSION,
@@ -721,35 +603,39 @@ export async function POST(req: NextRequest) {
             modelUsed: lm1.modelUsed,
             tookMs,
             transcriptQuality: { score, flags, band: band.band, note: band.note },
-            fallbackUsed,
+            fallbackUsed: true,
             usedRetry,
+            failedJsonParse: true,
             responseFormat: "json_schema",
-            truncated: truncatedFinal,
-            sanitize: { cjkFiltered: sres.hadCjk, changed: sres.changed },
+            truncated: true,
             llmInput: {
-              mode: salient.mode,
-              truncatedIn: salient.truncated,
-              sentChars: salient.text.length,
+              truncatedIn: lim.truncated,
+              originalChars: lim.originalChars,
+              sentChars: lim.sentChars,
               maxChars: MAX_LLM_INPUT_CHARS,
             },
           },
           analysisMissing: {
-            reason: !analysis.sections.reason,
-            findings: !analysis.sections.findings,
-            conclusions: !analysis.sections.conclusions,
-            recommendations: !analysis.sections.recommendations,
+            reason: !fallback.sections.reason,
+            findings: !fallback.sections.findings,
+            conclusions: !fallback.sections.conclusions,
+            recommendations: !fallback.sections.recommendations,
           },
           updatedAt: new Date(),
         });
 
-        return NextResponse.json({ ok: true, docPath: examRef.path, analysis, tookMs, fallbackUsed, usedRetry });
+        return NextResponse.json(
+          { ok: true, warning: "LLM JSON parse failed; stored fallback analysis", docPath: examRef.path, fallbackUsed: true, usedRetry },
+          { status: 200 }
+        );
       }
 
-      // primary parse succeeded
+      // retry succeeded
       const tookMs = Date.now() - started;
 
       let analysis = normalizeAnalysis(parsed);
 
+      // NEW: filtr CJK
       const sres = sanitizeAnalysisPolishOnly(analysis);
       analysis = sres.sanitized;
 
@@ -760,7 +646,7 @@ export async function POST(req: NextRequest) {
         fallbackUsed = true;
       }
 
-      const truncatedFinal = salient.truncated || truncatedOut1 || allNull;
+      const truncatedFinal = lim.truncated || truncatedOut1 || truncatedOut2 || allNull;
 
       await examRef.update({
         analysis,
@@ -777,13 +663,10 @@ export async function POST(req: NextRequest) {
           responseFormat: "json_schema",
           truncated: truncatedFinal,
           sanitize: { cjkFiltered: sres.hadCjk, changed: sres.changed },
-          llmTelemetry: {
-            primary: { finishReason: lm1.finishReason, usage: lm1.usage, truncatedOut: truncatedOut1 },
-          },
           llmInput: {
-            mode: salient.mode,
-            truncatedIn: salient.truncated,
-            sentChars: salient.text.length,
+            truncatedIn: lim.truncated,
+            originalChars: lim.originalChars,
+            sentChars: lim.sentChars,
             maxChars: MAX_LLM_INPUT_CHARS,
           },
         },
@@ -797,91 +680,64 @@ export async function POST(req: NextRequest) {
       });
 
       return NextResponse.json({ ok: true, docPath: examRef.path, analysis, tookMs, fallbackUsed, usedRetry });
-    } catch (e: any) {
-      const tookMs = Date.now() - started;
-      const msg = safeErrorMessage(e);
-
-      // ✅ KLUCZ: timeout nie powoduje braku analizy w DB
-      if (isTimeoutErrorMessage(msg)) {
-        const fallback = minimalFallbackAnalysis(String(transcript), score);
-
-        await examRef.update({
-          analysisError: {
-            at: new Date(),
-            version: PROMPT_VERSION,
-            engine: "lmstudio",
-            tookMs,
-            timeoutMs: LM_TIMEOUT_MS,
-            message: msg,
-            transcriptQuality: { score, flags, band: band.band, note: band.note },
-            llmInput: {
-              mode: salient.mode,
-              truncatedIn: salient.truncated,
-              sentChars: salient.text.length,
-              maxChars: MAX_LLM_INPUT_CHARS,
-            },
-          },
-          ...(hasExistingSections
-            ? {
-                analysisMeta: {
-                  ...(exam?.analysisMeta || {}),
-                  version: PROMPT_VERSION,
-                  warning: `LM Studio timeout (${LM_TIMEOUT_MS}ms); kept existing analysis`,
-                  keptExisting: true,
-                  timeout: true,
-                  tookMs,
-                },
-              }
-            : {
-                analysis: fallback,
-                analyzedAt: new Date(),
-                analysisMeta: {
-                  version: PROMPT_VERSION,
-                  engine: "lmstudio",
-                  tookMs,
-                  transcriptQuality: { score, flags, band: band.band, note: band.note },
-                  fallbackUsed: true,
-                  timeout: true,
-                  timeoutMs: LM_TIMEOUT_MS,
-                  llmInput: {
-                    mode: salient.mode,
-                    truncatedIn: salient.truncated,
-                    sentChars: salient.text.length,
-                    maxChars: MAX_LLM_INPUT_CHARS,
-                  },
-                },
-                analysisMissing: {
-                  reason: !fallback.sections.reason,
-                  findings: !fallback.sections.findings,
-                  conclusions: !fallback.sections.conclusions,
-                  recommendations: !fallback.sections.recommendations,
-                },
-              }),
-          updatedAt: new Date(),
-        });
-
-        return NextResponse.json(
-          {
-            ok: true,
-            warning: hasExistingSections
-              ? `LM Studio timeout (${LM_TIMEOUT_MS}ms); kept existing analysis`
-              : `LM Studio timeout (${LM_TIMEOUT_MS}ms); stored fallback analysis`,
-            keptExisting: !!hasExistingSections,
-            fallbackUsed: !hasExistingSections,
-            docPath: examRef.path,
-            tookMs,
-          },
-          { status: 200 }
-        );
-      }
-
-      // inne błędy -> normalnie 500
-      console.error("ANALYZE ERROR:", msg);
-      return NextResponse.json({ ok: false, error: msg }, { status: 500 });
     }
+
+    // primary parse succeeded
+    const tookMs = Date.now() - started;
+
+    let analysis = normalizeAnalysis(parsed);
+
+    // NEW: filtr CJK
+    const sres = sanitizeAnalysisPolishOnly(analysis);
+    analysis = sres.sanitized;
+
+    let fallbackUsed = false;
+    const allNull = isAllSectionsNull(analysis);
+    if (allNull) {
+      analysis = minimalFallbackAnalysis(String(transcript), score);
+      fallbackUsed = true;
+    }
+
+    const truncatedFinal = lim.truncated || truncatedOut1 || allNull;
+
+    await examRef.update({
+      analysis,
+      analyzedAt: new Date(),
+      analysisMeta: {
+        version: PROMPT_VERSION,
+        engine: "lmstudio",
+        baseUrl: lm1.baseUrl,
+        modelUsed: lm1.modelUsed,
+        tookMs,
+        transcriptQuality: { score, flags, band: band.band, note: band.note },
+        fallbackUsed,
+        usedRetry,
+        responseFormat: "json_schema",
+        truncated: truncatedFinal,
+        sanitize: { cjkFiltered: sres.hadCjk, changed: sres.changed },
+        llmTelemetry: {
+          primary: { finishReason: lm1.finishReason, usage: lm1.usage, truncatedOut: truncatedOut1 },
+        },
+        llmInput: {
+          truncatedIn: lim.truncated,
+          originalChars: lim.originalChars,
+          sentChars: lim.sentChars,
+          maxChars: MAX_LLM_INPUT_CHARS,
+        },
+      },
+      analysisMissing: {
+        reason: !analysis.sections.reason,
+        findings: !analysis.sections.findings,
+        conclusions: !analysis.sections.conclusions,
+        recommendations: !analysis.sections.recommendations,
+      },
+      updatedAt: new Date(),
+    });
+
+    return NextResponse.json({ ok: true, docPath: examRef.path, analysis, tookMs, fallbackUsed, usedRetry });
   } catch (err: any) {
     const message = safeErrorMessage(err);
-    console.error("ANALYZE ERROR (outer):", message);
+    console.error("ANALYZE ERROR:", message);
     return NextResponse.json({ ok: false, error: message }, { status: 500 });
   }
 }

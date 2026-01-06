@@ -671,7 +671,6 @@ export default function ExamPage() {
     }
   }
 
-  // ✅ POPRAWIONE: timeout/warning nie wywala runtime errora (nie robimy throw)
   async function analyzeNow() {
     setErr("");
     setOkMsg("");
@@ -698,27 +697,8 @@ export default function ExamPage() {
     const parsed = await readJsonOrText(res);
     const json = (parsed.kind === "json" ? parsed.json : null) as any;
 
-    // ⚠ Soft-fail: timeout / warning -> pokaż komunikat i nie wywalaj runtime errora
     if (!res.ok || !json?.ok) {
-      const msg =
-        json?.error ||
-        json?.warning ||
-        `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`;
-
-      const looksLikeTimeout =
-        typeof msg === "string" &&
-        (msg.toLowerCase().includes("timeout") ||
-          msg.toLowerCase().includes("przekroczono") ||
-          msg.toLowerCase().includes("abort"));
-
-      if (looksLikeTimeout) {
-        setErr(""); // nie traktujemy jako twardy błąd UI
-        setOkMsg(`⚠ Analiza nie zdążyła się zakończyć: ${msg}\nUżywam poprzednich danych (jeśli istnieją).`);
-        await load();
-        return;
-      }
-
-      throw new Error(msg);
+      throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`);
     }
 
     await load();
@@ -747,6 +727,7 @@ export default function ExamPage() {
           clinicId: cid,
           patientId: patientIdFromParams,
           examId,
+          // includeTranscriptSource domyślnie false w backendzie, więc tu nie musimy go wysyłać
         }),
       });
 
@@ -757,12 +738,14 @@ export default function ExamPage() {
         throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 800)}`);
       }
 
+      // ✅ Wczytaj świeżo zapisany report z Firestore i NADPISZ draft
       await load();
       const freshAfter = await fetchFreshExam();
 
       const fullReport = (freshAfter?.report || "").toString();
       setReportDraft(fullReport);
 
+      // raport wygenerowany już jest zapisany -> nie jest "dirty"
       reportDirtyRef.current = false;
       setReportDirty(false);
 
@@ -825,7 +808,6 @@ export default function ExamPage() {
 
         fresh = await fetchFreshExam();
         if (!fresh?.analysis?.sections) {
-          // analiza mogła timeoutować; pipeline ma prawo zatrzymać się tu
           throw new Error("Analiza nie została zapisana (sprawdź /api/exams/analyze).");
         }
       }
@@ -885,7 +867,9 @@ export default function ExamPage() {
       return;
     }
 
-    const confirm1 = window.confirm("Czy na pewno usunąć to badanie? Tej operacji nie da się cofnąć.");
+    const confirm1 = window.confirm(
+      "Czy na pewno usunąć to badanie? Tej operacji nie da się cofnąć."
+    );
     if (!confirm1) return;
 
     const deleteFiles = window.confirm(

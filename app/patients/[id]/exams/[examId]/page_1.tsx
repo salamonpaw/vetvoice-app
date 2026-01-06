@@ -164,6 +164,7 @@ export default function ExamPage() {
   const [pipelineStep, setPipelineStep] = useState<PipelineStep>("idle");
   const [pipelineMsg, setPipelineMsg] = useState("");
 
+  // NEW: preprocessing state
   const [preprocessing, setPreprocessing] = useState(false);
 
   // MediaRecorder state
@@ -189,15 +190,13 @@ export default function ExamPage() {
   const [reportDraft, setReportDraft] = useState("");
   const [reportDirty, setReportDirty] = useState(false);
 
+  // IMPORTANT: ref do natychmiastowego “dirty” (eliminuje race: setState vs load())
   const reportDirtyRef = useRef(false);
 
   // Import nagrania
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importing, setImporting] = useState(false);
   const [importRunPipeline, setImportRunPipeline] = useState(false);
-
-  // Delete
-  const [deletingExam, setDeletingExam] = useState(false);
 
   const examRef = useMemo(() => {
     if (!patientIdFromParams || !examId) return null;
@@ -211,6 +210,7 @@ export default function ExamPage() {
   const missing = exam?.analysisMissing;
   const hasAnyAnalysis = !!exam?.analysis?.sections || !!exam?.analysisMissing;
 
+  // NEW: quality from either transcriptQuality or transcriptMeta fallback
   const qualityScore =
     typeof exam?.transcriptQuality?.score === "number"
       ? exam.transcriptQuality.score
@@ -226,6 +226,7 @@ export default function ExamPage() {
   const isQualityLow = typeof qualityScore === "number" && qualityScore < 75;
   const wasPreprocessed = Boolean(exam?.transcriptMeta?.audioWasPreprocessed);
 
+  // timer tick
   useEffect(() => {
     if (recState !== "recording") return;
 
@@ -236,12 +237,14 @@ export default function ExamPage() {
     return () => window.clearInterval(t);
   }, [recState]);
 
+  // cleanup object URL
   useEffect(() => {
     return () => {
       if (recordedUrl) URL.revokeObjectURL(recordedUrl);
     };
   }, [recordedUrl]);
 
+  // cleanup stream on unmount
   useEffect(() => {
     return () => {
       tryStopTracks();
@@ -281,7 +284,7 @@ export default function ExamPage() {
 
       setExam(data);
 
-      // normalnie nie nadpisujemy jeśli user edytuje...
+      // NIE NADPISUJ raportu jeśli user zaczął edycję / pipeline już wstawił draft
       if (!reportDirtyRef.current) {
         setReportDraft(data?.report || "");
       }
@@ -520,6 +523,7 @@ export default function ExamPage() {
       return;
     }
 
+    // blokujemy w trakcie innych akcji
     if (importing || savingAudio || transcribing || generatingReport || savingReport) return;
 
     setImporting(true);
@@ -531,6 +535,7 @@ export default function ExamPage() {
       form.append("clinicId", clinicId);
       form.append("patientId", patientIdFromParams);
       form.append("examId", examId);
+      // nie znamy durationMs przy imporcie bez dekodowania audio — zostawiamy 0
       form.append("durationMs", "0");
 
       const res = await fetch("/api/recordings", { method: "POST", body: form });
@@ -627,6 +632,7 @@ export default function ExamPage() {
 
     setPreprocessing(true);
     try {
+      // 1) preprocess audio
       const pRes = await fetch("/api/exams/preprocess-audio", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -638,10 +644,12 @@ export default function ExamPage() {
 
       if (!pRes.ok || !pJson?.ok) {
         throw new Error(
-          pJson?.error || `Preprocess: HTTP ${pRes.status} ${pRes.statusText}\n${pParsed.text.slice(0, 800)}`
+          pJson?.error ||
+            `Preprocess: HTTP ${pRes.status} ${pRes.statusText}\n${pParsed.text.slice(0, 800)}`
         );
       }
 
+      // 2) transcribe using preprocessed
       const tRes = await fetch("/api/exams/transcribe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -657,7 +665,8 @@ export default function ExamPage() {
 
       if (!tRes.ok || !tJson?.ok) {
         throw new Error(
-          tJson?.error || `Transkrypcja: HTTP ${tRes.status} ${tRes.statusText}\n${tParsed.text.slice(0, 800)}`
+          tJson?.error ||
+            `Transkrypcja: HTTP ${tRes.status} ${tRes.statusText}\n${tParsed.text.slice(0, 800)}`
         );
       }
 
@@ -671,7 +680,6 @@ export default function ExamPage() {
     }
   }
 
-  // ✅ POPRAWIONE: timeout/warning nie wywala runtime errora (nie robimy throw)
   async function analyzeNow() {
     setErr("");
     setOkMsg("");
@@ -698,34 +706,14 @@ export default function ExamPage() {
     const parsed = await readJsonOrText(res);
     const json = (parsed.kind === "json" ? parsed.json : null) as any;
 
-    // ⚠ Soft-fail: timeout / warning -> pokaż komunikat i nie wywalaj runtime errora
     if (!res.ok || !json?.ok) {
-      const msg =
-        json?.error ||
-        json?.warning ||
-        `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`;
-
-      const looksLikeTimeout =
-        typeof msg === "string" &&
-        (msg.toLowerCase().includes("timeout") ||
-          msg.toLowerCase().includes("przekroczono") ||
-          msg.toLowerCase().includes("abort"));
-
-      if (looksLikeTimeout) {
-        setErr(""); // nie traktujemy jako twardy błąd UI
-        setOkMsg(`⚠ Analiza nie zdążyła się zakończyć: ${msg}\nUżywam poprzednich danych (jeśli istnieją).`);
-        await load();
-        return;
-      }
-
-      throw new Error(msg);
+      throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`);
     }
 
     await load();
     setOkMsg("✅ Analiza gotowa");
   }
 
-  // ✅ KLUCZOWA ZMIANA: "Odśwież" zawsze nadpisuje draft raportem z Firestore (pełnym), a nie preview
   async function generateReportNow() {
     setErr("");
     setOkMsg("");
@@ -737,17 +725,13 @@ export default function ExamPage() {
 
     setGeneratingReport(true);
     try {
-      const freshBefore = await fetchFreshExam();
-      const cid = getCidFromStateOrExam(freshBefore);
+      const fresh = await fetchFreshExam();
+      const cid = getCidFromStateOrExam(fresh);
 
       const res = await fetch("/api/exams/generate-report", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          clinicId: cid,
-          patientId: patientIdFromParams,
-          examId,
-        }),
+        body: JSON.stringify({ clinicId: cid, patientId: patientIdFromParams, examId }),
       });
 
       const parsed = await readJsonOrText(res);
@@ -757,16 +741,18 @@ export default function ExamPage() {
         throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 800)}`);
       }
 
+      const maybeReport =
+        (typeof json?.report === "string" && json.report.trim() ? json.report : "") ||
+        (typeof json?.reportPreview === "string" && json.reportPreview.trim() ? json.reportPreview : "");
+
+      if (maybeReport) {
+        setReportDraft(maybeReport);
+        reportDirtyRef.current = true;
+        setReportDirty(true);
+      }
+
       await load();
-      const freshAfter = await fetchFreshExam();
-
-      const fullReport = (freshAfter?.report || "").toString();
-      setReportDraft(fullReport);
-
-      reportDirtyRef.current = false;
-      setReportDirty(false);
-
-      setOkMsg("✅ Raport wygenerowany (nadpisano draft)");
+      setOkMsg("✅ Raport wygenerowany");
     } catch (e: any) {
       setErr(e?.message || "Błąd generowania raportu");
       setOkMsg("");
@@ -807,9 +793,7 @@ export default function ExamPage() {
         const json = (parsed.kind === "json" ? parsed.json : null) as any;
 
         if (!res.ok || !json?.ok) {
-          throw new Error(
-            json?.error || `Transkrypcja: HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`
-          );
+          throw new Error(json?.error || `Transkrypcja: HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`);
         }
 
         await load();
@@ -825,7 +809,6 @@ export default function ExamPage() {
 
         fresh = await fetchFreshExam();
         if (!fresh?.analysis?.sections) {
-          // analiza mogła timeoutować; pipeline ma prawo zatrzymać się tu
           throw new Error("Analiza nie została zapisana (sprawdź /api/exams/analyze).");
         }
       }
@@ -876,54 +859,6 @@ export default function ExamPage() {
     }
   }
 
-  async function deleteExamNow() {
-    setErr("");
-    setOkMsg("");
-
-    if (!patientIdFromParams || !examId) {
-      setErr("Brak patientId/examId.");
-      return;
-    }
-
-    const confirm1 = window.confirm("Czy na pewno usunąć to badanie? Tej operacji nie da się cofnąć.");
-    if (!confirm1) return;
-
-    const deleteFiles = window.confirm(
-      "Usunąć też lokalne pliki nagrania (z dysku serwera/dev)?\n\nOK = usuń też pliki\nAnuluj = usuń tylko dokument w Firestore"
-    );
-
-    setDeletingExam(true);
-    try {
-      const cid = getCidFromStateOrExam(exam);
-
-      const res = await fetch("/api/exams/delete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          clinicId: cid,
-          patientId: patientIdFromParams,
-          examId,
-          deleteLocalFiles: deleteFiles,
-        }),
-      });
-
-      const parsed = await readJsonOrText(res);
-      const json = (parsed.kind === "json" ? parsed.json : null) as any;
-
-      if (!res.ok || !json?.ok) {
-        throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 800)}`);
-      }
-
-      setOkMsg("✅ Badanie usunięte");
-      router.push(`/patients/${patientIdFromParams}`);
-    } catch (e: any) {
-      setErr(e?.message || "Błąd usuwania badania");
-      setOkMsg("");
-    } finally {
-      setDeletingExam(false);
-    }
-  }
-
   if (loading) return <div className="p-6">Ładowanie…</div>;
   if (!exam) return <div className="p-6">Brak badania</div>;
 
@@ -934,7 +869,6 @@ export default function ExamPage() {
     savingReport ||
     importing ||
     preprocessing ||
-    deletingExam ||
     (pipelineStep !== "idle" && pipelineStep !== "done" && pipelineStep !== "error");
 
   const canStart = !uiLocked && recState === "idle";
@@ -945,6 +879,7 @@ export default function ExamPage() {
 
   const backPid = exam?.patientId || patientIdFromParams;
 
+  // quiet stepper states
   const stepRecordingDone = !!exam?.recording?.localPath;
   const stepTranscriptDone = !!exam?.transcript?.trim();
   const stepAnalysisDone = !!exam?.analysis?.sections;
@@ -979,6 +914,7 @@ export default function ExamPage() {
 
   return (
     <div className="space-y-5">
+      {/* Alerts */}
       {(err || okMsg) && (
         <div className="space-y-2">
           {err && (
@@ -997,12 +933,12 @@ export default function ExamPage() {
         </div>
       )}
 
+      {/* Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <div className="text-xl font-semibold tracking-tight">{typeLabel(exam.type)}</div>
           <div className="mt-1 text-xs text-slate-500">
-            Patient: <span className="font-mono">{patientIdFromParams}</span> • Exam:{" "}
-            <span className="font-mono">{examId}</span>
+            Patient: <span className="font-mono">{patientIdFromParams}</span> • Exam: <span className="font-mono">{examId}</span>
           </div>
         </div>
 
@@ -1023,32 +959,16 @@ export default function ExamPage() {
           >
             Wróć
           </button>
-
-          <button
-            className="rounded-xl border border-red-200 bg-white px-3 py-2 text-sm text-red-700 hover:bg-red-50 disabled:opacity-50"
-            onClick={deleteExamNow}
-            disabled={uiLocked}
-            title="Usuń badanie"
-          >
-            {deletingExam ? "Usuwam…" : "Usuń"}
-          </button>
         </div>
       </div>
 
+      {/* Quiet Stepper */}
       <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepRecordingDone, activeRec, false)}`}>
-            Nagranie
-          </span>
-          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepTranscriptDone, activeTranscribe, transBlocked)}`}>
-            Transkrypcja
-          </span>
-          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepAnalysisDone, activeAnalyze, analyzeBlocked)}`}>
-            Analiza
-          </span>
-          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepReportDone, activeReport, reportBlocked)}`}>
-            Raport
-          </span>
+          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepRecordingDone, activeRec, false)}`}>Nagranie</span>
+          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepTranscriptDone, activeTranscribe, transBlocked)}`}>Transkrypcja</span>
+          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepAnalysisDone, activeAnalyze, analyzeBlocked)}`}>Analiza</span>
+          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepReportDone, activeReport, reportBlocked)}`}>Raport</span>
 
           {hasAnyAnalysis && (
             <div className="ml-1 flex flex-wrap items-center gap-1 text-xs text-slate-500">
@@ -1062,7 +982,9 @@ export default function ExamPage() {
         </div>
       </div>
 
+      {/* Main grid */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
+        {/* Left: one Process card */}
         <div className="lg:col-span-2">
           <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm space-y-5">
             <div className="flex items-start justify-between gap-3">
@@ -1083,7 +1005,7 @@ export default function ExamPage() {
               </button>
             </div>
 
-            {/* Nagrywanie */}
+            {/* Recording */}
             <div className="space-y-3">
               <div className="flex items-center justify-between">
                 <div className="text-sm font-semibold">Nagrywanie</div>
@@ -1195,6 +1117,7 @@ export default function ExamPage() {
               </div>
             </div>
 
+            {/* Local file */}
             {hasLocalRecording && (
               <div className="space-y-2">
                 <div className="text-sm font-semibold">Plik nagrania</div>
@@ -1217,6 +1140,7 @@ export default function ExamPage() {
               </div>
             )}
 
+            {/* Transcript */}
             {(hasLocalRecording || hasTranscript) && (
               <div className="space-y-3">
                 <div className="flex items-center justify-between gap-2">
@@ -1302,6 +1226,7 @@ export default function ExamPage() {
           </section>
         </div>
 
+        {/* Right: Report */}
         <div className="lg:col-span-3">
           <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-md space-y-3">
             <div className="flex items-center justify-between gap-2">
@@ -1325,7 +1250,7 @@ export default function ExamPage() {
                   className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
                   onClick={generateReportNow}
                   disabled={uiLocked}
-                  title="Generuj raport na nowo i nadpisz draft"
+                  title="Generuj raport z aktualnej analizy"
                 >
                   {generatingReport ? "Generuję…" : "Odśwież"}
                 </button>
