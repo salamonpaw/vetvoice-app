@@ -8,7 +8,8 @@ import fs from "fs/promises";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 
-const REPORT_VERSION = "analysis-template-v2-p06-reason+patientname-headers";
+const REPORT_VERSION =
+  "analysis-template-v2-p09-aggregate-findings-by-organ+anti-loop+wnioski-fallback+no-transcript";
 const DATE_LOCALE = "pl-PL";
 
 /* ================= Firebase ================= */
@@ -45,32 +46,135 @@ function cleanLine(s: string) {
   return String(s ?? "").replace(/\s+/g, " ").trim();
 }
 
-function uniqueLines(lines: string[]) {
-  const seen = new Set<string>();
+function normKey(s: string) {
+  return cleanLine(s)
+    .toLowerCase()
+    .replace(/[.。]\s*$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Anti-loop na poziomie raportu:
+ * - jeśli linia powtarza się > maxRepeats, zostawia keep (domyślnie 1)
+ * - dodatkowo robi finalne uniq (case-insensitive)
+ */
+function limitRepeatedLines(lines: string[], opts?: { maxRepeats?: number; keep?: number }) {
+  const maxRepeats = opts?.maxRepeats ?? 2;
+  const keep = opts?.keep ?? 1;
+
+  const counts = new Map<string, number>();
+  const kept = new Map<string, number>();
   const out: string[] = [];
-  for (const l of lines) {
-    const key = l.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(l);
+
+  for (const raw of lines) {
+    const line = cleanLine(raw);
+    if (!line) continue;
+
+    const key = normKey(line);
+    const c = (counts.get(key) ?? 0) + 1;
+    counts.set(key, c);
+
+    if (c > maxRepeats) {
+      const k = kept.get(key) ?? 0;
+      if (k < keep) {
+        out.push(line);
+        kept.set(key, k + 1);
+      }
+      continue;
+    }
+
+    out.push(line);
   }
+
+  const seen = new Set<string>();
+  const uniq: string[] = [];
+  for (const l of out) {
+    const k = normKey(l);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    uniq.push(l);
+  }
+  return uniq;
+}
+
+function isNoiseFinding(line: string) {
+  const s = cleanLine(line);
+  if (!s) return true;
+
+  // same nagłówki typu "Śledziona." / "Jelito." / "Nerki."
+  if (/^[A-ZĄĆĘŁŃÓŚŻŹ][a-ząćęłńóśżź]+[.!?]?$/.test(s)) return true;
+
+  // zbyt krótkie, bez treści
+  const wc = s.split(" ").filter(Boolean).length;
+  if (wc <= 2) return true;
+
+  // ogólniaki
+  const low = s.toLowerCase();
+  if (low.includes("wydaje się, że nie ma żadnego problemu")) return true;
+
+  return false;
+}
+
+/**
+ * Agreguje OPIS BADANIA po narządzie:
+ * - wejście: ["Wątroba: ...", "Wątroba: ...", "Śledziona: ..."]
+ * - wyjście: ["Wątroba: ...; ...; ...", "Śledziona: ..."]
+ *
+ * Zachowuje kolejność narządów wg pierwszego wystąpienia.
+ */
+function aggregateFindingsByOrgan(findings: string[]) {
+  const groups = new Map<string, string[]>();
+  const passthrough: string[] = [];
+
+  for (const raw of findings) {
+    const line = cleanLine(raw);
+    if (!line) continue;
+    if (isNoiseFinding(line)) continue;
+
+    const idx = line.indexOf(":");
+    if (idx === -1) {
+      passthrough.push(line);
+      continue;
+    }
+
+    const organ = cleanLine(line.slice(0, idx));
+    const desc = cleanLine(line.slice(idx + 1));
+    if (!organ || !desc) continue;
+
+    const arr = groups.get(organ) ?? [];
+    arr.push(desc);
+    groups.set(organ, arr);
+  }
+
+  const order: string[] = [];
+  for (const raw of findings) {
+    const idx = String(raw).indexOf(":");
+    if (idx === -1) continue;
+    const organ = cleanLine(String(raw).slice(0, idx));
+    if (!organ) continue;
+    if (!order.includes(organ)) order.push(organ);
+  }
+
+  const out: string[] = [];
+  for (const organ of order) {
+    const descs = groups.get(organ) ?? [];
+    if (!descs.length) continue;
+
+    const merged = limitRepeatedLines(descs, { maxRepeats: 1, keep: 1 }).join("; ");
+    out.push(`${organ}: ${merged}`);
+  }
+
+  const tail = limitRepeatedLines(passthrough, { maxRepeats: 1, keep: 1 });
+  for (const t of tail) out.push(t);
+
   return out;
 }
 
 /* ================= POWÓD BADANIA ================= */
 
-function resolveExamReason({
-  facts,
-  analysis,
-}: {
-  facts?: any;
-  analysis?: any;
-}): string {
-  const candidates = [
-    facts?.exam?.reason,
-    facts?.reason,
-    analysis?.sections?.reason,
-  ];
+function resolveExamReason({ facts, analysis }: { facts?: any; analysis?: any }): string {
+  const candidates = [facts?.exam?.reason, facts?.reason, analysis?.sections?.reason];
 
   for (const c of candidates) {
     if (typeof c === "string") {
@@ -80,6 +184,36 @@ function resolveExamReason({
   }
 
   return "Nie podano w transkrypcji.";
+}
+
+/* ================= WNIOSKI fallback ================= */
+
+function resolveConclusions({ facts, impression }: { facts?: any; impression?: any }) {
+  const fromImpression: string[] = Array.isArray(impression?.doctorKeyConcerns)
+    ? impression.doctorKeyConcerns
+    : [];
+
+  if (fromImpression.length) return fromImpression;
+
+  const findings: string[] = Array.isArray(facts?.findings) ? facts.findings : [];
+
+  const candidates = findings.filter((l) => {
+    const k = l.toLowerCase();
+    return (
+      k.startsWith("podsumowanie") ||
+      k.includes("podsumowanie badania") ||
+      k.includes("obraz usg wskazuje") ||
+      k.includes("przemawia za") ||
+      k.includes("sugeruje") ||
+      k.includes("najpewniej") ||
+      k.includes("cechy przewlekłego") ||
+      k.includes("krążenia wrotno") ||
+      k.includes("nadciśnienia wrotnego") ||
+      k.includes("przekrwieniem biernym")
+    );
+  });
+
+  return limitRepeatedLines(candidates, { maxRepeats: 1, keep: 1 });
 }
 
 /* ================= Render helpers ================= */
@@ -110,19 +244,14 @@ export async function POST(req: NextRequest) {
       };
 
     if (!patientId || !examId) {
-      return NextResponse.json(
-        { error: "Missing patientId or examId" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Missing patientId or examId" }, { status: 400 });
     }
 
     const adminDb = await getAdminDb();
     const ref = adminDb.doc(`patients/${patientId}/exams/${examId}`);
     const snap = await ref.get();
 
-    if (!snap.exists) {
-      return NextResponse.json({ error: "Exam not found" }, { status: 404 });
-    }
+    if (!snap.exists) return NextResponse.json({ error: "Exam not found" }, { status: 404 });
 
     const exam = snap.data() as any;
 
@@ -138,9 +267,7 @@ export async function POST(req: NextRequest) {
     lines.push(`Data wygenerowania: ${formatDatePL(new Date())}`);
 
     const patientName = cleanLine(facts?.exam?.patientName || "");
-    if (patientName) {
-      lines.push(`Pacjent: ${patientName}`);
-    }
+    if (patientName) lines.push(`Pacjent: ${patientName}`);
     lines.push("");
 
     /* ================= POWÓD BADANIA ================= */
@@ -152,26 +279,20 @@ export async function POST(req: NextRequest) {
 
     /* ================= WARUNKI BADANIA ================= */
 
-    const conditions: string[] = Array.isArray(facts?.conditions)
-      ? facts.conditions
-      : [];
-
+    const conditionsRaw: string[] = Array.isArray(facts?.conditions) ? facts.conditions : [];
+    const conditions = limitRepeatedLines(conditionsRaw, { maxRepeats: 2, keep: 1 });
     lines.push(...renderListSection("WARUNKI BADANIA", conditions));
 
     /* ================= OPIS BADANIA ================= */
 
-    const findings: string[] = Array.isArray(facts?.findings)
-      ? uniqueLines(facts.findings)
-      : [];
-
+    const findingsRaw: string[] = Array.isArray(facts?.findings) ? facts.findings : [];
+    const findingsAgg = aggregateFindingsByOrgan(findingsRaw);
+    const findings = limitRepeatedLines(findingsAgg, { maxRepeats: 2, keep: 1 });
     lines.push(...renderListSection("OPIS BADANIA", findings));
 
     /* ================= POMIARY ================= */
 
-    const measurements: any[] = Array.isArray(facts?.measurements)
-      ? facts.measurements
-      : [];
-
+    const measurements: any[] = Array.isArray(facts?.measurements) ? facts.measurements : [];
     const measurementLines: string[] = [];
 
     for (const m of measurements) {
@@ -179,9 +300,7 @@ export async function POST(req: NextRequest) {
       if (!m.unit) continue;
 
       const range =
-        m.value.length === 1
-          ? `${m.value[0]}`
-          : `${m.value[0]}–${m.value[m.value.length - 1]}`;
+        m.value.length === 1 ? `${m.value[0]}` : `${m.value[0]}–${m.value[m.value.length - 1]}`;
 
       const labelParts = [m.structure, m.location].filter(Boolean);
       const label = labelParts.join(" – ");
@@ -189,41 +308,42 @@ export async function POST(req: NextRequest) {
       measurementLines.push(`${label}: ${range} ${m.unit}`);
     }
 
-    // P0.6: bez dopisku w nawiasie
-    lines.push(...renderListSection("POMIARY", measurementLines));
+    lines.push(
+      ...renderListSection(
+        "POMIARY",
+        limitRepeatedLines(measurementLines, { maxRepeats: 2, keep: 1 })
+      )
+    );
 
     /* ================= WNIOSKI ================= */
 
-    const conclusions: string[] = Array.isArray(impression?.doctorKeyConcerns)
-      ? impression.doctorKeyConcerns
-      : [];
-
-    // P0.6: sama nazwa "WNIOSKI"
-    lines.push(...renderListSection("WNIOSKI", conclusions));
+    const conclusions = resolveConclusions({ facts, impression });
+    lines.push(
+      ...renderListSection("WNIOSKI", limitRepeatedLines(conclusions, { maxRepeats: 2, keep: 1 }))
+    );
 
     /* ================= ZALECENIA ================= */
 
-    const recommendations: string[] = Array.isArray(impression?.doctorPlan)
+    const recommendationsRaw: string[] = Array.isArray(impression?.doctorPlan)
       ? impression.doctorPlan
       : [];
-
+    const recommendations = limitRepeatedLines(recommendationsRaw, { maxRepeats: 2, keep: 1 });
     lines.push(...renderListSection("ZALECENIA", recommendations));
 
     /* ================= OBJAWY ALARMOWE ================= */
 
-    const redFlags: string[] = Array.isArray(impression?.doctorRedFlags)
+    const redFlagsRaw: string[] = Array.isArray(impression?.doctorRedFlags)
       ? impression.doctorRedFlags
       : [];
-
+    const redFlags = limitRepeatedLines(redFlagsRaw, { maxRepeats: 2, keep: 1 });
     lines.push(...renderListSection("OBJAWY ALARMOWE", redFlags));
 
     /* ================= Footer ================= */
 
-    lines.push(
-      "Uwaga: Dokument został automatycznie wygenerowany na podstawie transkrypcji i analizy AI."
-    );
+    lines.push("Uwaga: Dokument został automatycznie wygenerowany na podstawie transkrypcji i analizy AI.");
     lines.push("Wymagana jest weryfikacja i zatwierdzenie przez lekarza.");
 
+    // Celowo: brak transkrypcji w raporcie — żadnego doklejania transcriptRaw.
     const reportText = lines.join("\n");
 
     /* ================= Save ================= */
@@ -240,13 +360,10 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       ok: true,
-      reportPreview: reportText,
       docPath: ref.path,
+      reportPreview: reportText,
     });
   } catch (e: any) {
-    return NextResponse.json(
-      { error: e?.message || "Unknown error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: e?.message ?? "Unknown error" }, { status: 500 });
   }
 }
