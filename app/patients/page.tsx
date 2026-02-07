@@ -2,6 +2,11 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { Box, Chip, Paper, Stack, Typography } from "@mui/material";
+import { PrimaryButton } from "@/app/_components/Buttons";
+import SectionCard from "@/app/_components/SectionCard";
+import PeopleAltOutlinedIcon from "@mui/icons-material/PeopleAltOutlined";
+import PersonSearchOutlinedIcon from "@mui/icons-material/PersonSearchOutlined";
 import { collection, getDocs, query, where, orderBy } from "firebase/firestore";
 import { db } from "@/lib/firebase/client";
 import { getMyClinicId, USER_TS_VERSION } from "@/lib/firebase/user";
@@ -46,50 +51,77 @@ export default function PatientsPage() {
   }, []);
 
   return (
-    <div className="space-y-5">
-      {/* Header */}
-      <div className="flex items-center justify-between gap-3">
-        <div className="text-lg font-semibold tracking-tight">Pacjenci</div>
+    <Stack spacing={3}>
+      <Stack direction={{ xs: "column", sm: "row" }} spacing={2} justifyContent="space-between">
+        <Box>
+          <Typography variant="h5" fontWeight={700}>
+            Pacjenci
+          </Typography>
+          <Typography variant="body2" color="text.secondary">
+            Zarządzaj kartami pacjentów i badaniami.
+          </Typography>
+        </Box>
 
-        <Link
-          href="/patients/new"
-          className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50"
-        >
-          Dodaj pacjenta
-        </Link>
-      </div>
-
-      <div className="text-xs text-slate-500">user.ts version: {USER_TS_VERSION}</div>
+        <Stack direction="row" spacing={1} alignItems="center">
+          <Chip
+            label={`user.ts v${USER_TS_VERSION}`}
+            size="small"
+            variant="outlined"
+          />
+          <PrimaryButton
+            component={Link}
+            href="/patients/new"
+            size="medium"
+          >
+            Dodaj pacjenta
+          </PrimaryButton>
+        </Stack>
+      </Stack>
 
       {/* Loading / Error */}
       {loading && (
-        <div className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-700 shadow-sm">
-          Ładowanie…
-        </div>
+        <SectionCard
+          title="Ładowanie"
+          subtitle="Pobieranie listy pacjentów."
+          icon={<PersonSearchOutlinedIcon />}
+        >
+          <Typography variant="body2">Ładowanie…</Typography>
+        </SectionCard>
       )}
 
       {error && !loading && (
-        <div className="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm text-red-800 shadow-sm">
-          <div className="font-semibold">Błąd</div>
-          <div className="mt-1 whitespace-pre-wrap">{error}</div>
-        </div>
+        <Paper
+          variant="outlined"
+          sx={{ p: 3, borderColor: "error.light", bgcolor: "error.50" }}
+        >
+          <Typography fontWeight={600}>Błąd</Typography>
+          <Typography variant="body2" sx={{ mt: 1, whiteSpace: "pre-wrap" }}>
+            {error}
+          </Typography>
+        </Paper>
       )}
 
       {/* Empty */}
       {!loading && !error && patients.length === 0 && (
-        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-          <div className="text-sm font-semibold text-slate-900">Brak pacjentów</div>
-          <div className="mt-1 text-sm text-slate-600">Dodaj pierwszego pacjenta, aby rozpocząć pracę.</div>
-        </div>
+        <SectionCard
+          title="Brak pacjentów"
+          subtitle="Dodaj pierwszego pacjenta, aby rozpocząć pracę."
+          icon={<PeopleAltOutlinedIcon />}
+        >
+          <Typography variant="body2" color="text.secondary">
+            Użyj przycisku „Dodaj pacjenta”.
+          </Typography>
+        </SectionCard>
       )}
 
       {/* List */}
       {!loading && !error && patients.length > 0 && (
-        <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-          <div className="text-sm font-semibold text-slate-900">Lista pacjentów</div>
-          <div className="mt-1 text-xs text-slate-500">Kliknij pacjenta, aby przejść do karty i badań.</div>
-
-          <div className="mt-4 grid gap-2">
+        <SectionCard
+          title="Lista pacjentów"
+          subtitle="Kliknij pacjenta, aby przejść do karty i badań."
+          icon={<PeopleAltOutlinedIcon />}
+        >
+          <Stack spacing={2}>
             {patients.map((p) => {
               const name = (p.name || "").trim() || "Bez imienia";
               const species = (p.species || "").trim() || "nieznany gatunek";
@@ -97,40 +129,46 @@ export default function PatientsPage() {
               const ownerName = (p.ownerName || "").toString().trim();
 
               return (
-                <Link
+                <Paper
                   key={p.id}
+                  component={Link}
                   href={`/patients/${p.id}`}
-                  className={[
-                    "group block rounded-2xl border border-slate-200 bg-white p-4",
-                    "hover:bg-slate-50 hover:border-slate-300",
-                    "focus:outline-none focus:ring-2 focus:ring-slate-200",
-                    "transition",
-                  ].join(" ")}
+                  variant="outlined"
+                  sx={{
+                    p: 2,
+                    textDecoration: "none",
+                    display: "block",
+                    transition: "all 150ms ease",
+                    "&:hover": {
+                      borderColor: "primary.light",
+                      boxShadow: "0 12px 30px rgba(15, 23, 42, 0.08)",
+                    },
+                  }}
                 >
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="min-w-0">
-                      <div className="text-base font-semibold text-slate-900">{name}</div>
-
-                      <div className="mt-1 text-sm text-slate-600">
+                  <Stack direction="row" spacing={2} alignItems="flex-start">
+                    <Box sx={{ flex: 1, minWidth: 0 }}>
+                      <Typography fontWeight={600}>{name}</Typography>
+                      <Typography variant="body2" color="text.secondary">
                         {species}
                         {breed ? ` • ${breed}` : ""}
-                      </div>
-
+                      </Typography>
                       {ownerName ? (
-                        <div className="mt-2 text-sm text-slate-600">
-                          <span className="text-slate-500">Właściciel:</span> {ownerName}
-                        </div>
+                        <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                          <Box component="span" color="text.disabled">
+                            Właściciel:
+                          </Box>{" "}
+                          {ownerName}
+                        </Typography>
                       ) : null}
-                    </div>
-
-                    <div className="text-slate-400 group-hover:text-slate-600 transition">→</div>
-                  </div>
-                </Link>
+                    </Box>
+                    <Typography color="text.disabled">→</Typography>
+                  </Stack>
+                </Paper>
               );
             })}
-          </div>
-        </section>
+          </Stack>
+        </SectionCard>
       )}
-    </div>
+    </Stack>
   );
 }

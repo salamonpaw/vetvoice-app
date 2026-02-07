@@ -1,6 +1,17 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
+import {
+  Alert,
+  Box,
+  Button,
+  Checkbox,
+  FormControlLabel,
+  Paper,
+  Stack,
+  TextField,
+  Typography,
+} from "@mui/material";
 
 type Props = {
   children: React.ReactNode;
@@ -79,80 +90,89 @@ export default function AuthGate({ children }: Props) {
   }
 
   if (!ready) {
-    return <div className="min-h-screen bg-slate-50" />;
+    return <Box sx={{ minHeight: "100vh" }} />;
   }
 
   if (authed) {
     // Mały pasek u góry (opcjonalny, ale UX-owo wygodny)
     return (
-      <div className="space-y-3">
-        <div className="flex items-center justify-end">
-          <button
-            onClick={logout}
-            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50"
-            title="Wyloguj"
-          >
+      <Box>
+        <Stack direction="row" justifyContent="flex-end" sx={{ mb: 2 }}>
+          <Button variant="outlined" size="small" onClick={logout}>
             Wyloguj
-          </button>
-        </div>
+          </Button>
+        </Stack>
         {children}
-      </div>
+      </Box>
     );
   }
 
   return (
-    <div className="min-h-[70vh] flex items-center justify-center">
-      <div className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-        <div className="text-lg font-semibold tracking-tight">Zaloguj się</div>
-        <div className="mt-1 text-sm text-slate-600">VetVoice (PoC)</div>
+    <Box
+      sx={{
+        minHeight: { xs: "70vh", md: "75vh" },
+        display: "grid",
+        placeItems: "center",
+      }}
+    >
+      <Paper
+        elevation={0}
+        sx={{
+          width: "100%",
+          maxWidth: 420,
+          p: 4,
+          borderRadius: 3,
+        }}
+      >
+        <Stack spacing={1} sx={{ mb: 3 }}>
+          <Typography variant="h5" fontWeight={700}>
+            Zaloguj się
+          </Typography>
+          <Typography variant="body2" color="text.secondary">
+            VetVoice (PoC)
+          </Typography>
+        </Stack>
 
-        {err && (
-          <div className="mt-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+        {err ? (
+          <Alert severity="error" sx={{ mb: 2 }}>
             {err}
-          </div>
-        )}
+          </Alert>
+        ) : null}
 
-        <form onSubmit={onSubmit} className="mt-4 space-y-3">
-          <label className="grid gap-1">
-            <span className="text-sm font-medium text-slate-900">Login</span>
-            <input
+        <Box component="form" onSubmit={onSubmit}>
+          <Stack spacing={2}>
+            <TextField
+              label="Login"
               value={login}
               onChange={(e) => setLogin(e.target.value)}
               placeholder="np. alk@alk.pl"
-              className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-200"
               autoComplete="username"
+              fullWidth
             />
-          </label>
-
-          <label className="grid gap-1">
-            <span className="text-sm font-medium text-slate-900">PIN</span>
-            <input
+            <TextField
+              label="PIN"
               value={pin}
               onChange={(e) => setPin(e.target.value)}
               placeholder="••••••"
-              className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-200"
               type="password"
               autoComplete="current-password"
+              fullWidth
             />
-          </label>
-
-          <label className="flex items-center gap-2 text-sm text-slate-700 select-none">
-            <input
-              type="checkbox"
-              checked={remember}
-              onChange={(e) => setRemember(e.target.checked)}
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={remember}
+                  onChange={(e) => setRemember(e.target.checked)}
+                />
+              }
+              label="Zapamiętaj mnie"
             />
-            Zapamiętaj mnie
-          </label>
-
-          <button
-            type="submit"
-            className="w-full rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-medium text-white hover:bg-slate-800"
-          >
-            Zaloguj
-          </button>
-        </form>
-      </div>
-    </div>
+            <Button type="submit" variant="contained" size="large">
+              Zaloguj
+            </Button>
+          </Stack>
+        </Box>
+      </Paper>
+    </Box>
   );
 }

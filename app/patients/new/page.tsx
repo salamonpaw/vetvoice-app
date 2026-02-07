@@ -3,6 +3,11 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { Box, Stack, TextField, Typography } from "@mui/material";
+import SectionCard from "@/app/_components/SectionCard";
+import { PrimaryButton, SecondaryButton } from "@/app/_components/Buttons";
+import FormStack from "@/app/_components/FormStack";
+import PersonAddOutlinedIcon from "@mui/icons-material/PersonAddOutlined";
 import { addDoc, collection, serverTimestamp } from "firebase/firestore";
 import { db } from "@/lib/firebase/client";
 import { getMyClinicId } from "@/lib/firebase/user";
@@ -53,70 +58,77 @@ export default function NewPatientPage() {
   }
 
   return (
-    <div style={{ padding: 24, fontFamily: "system-ui", maxWidth: 520 }}>
-      <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-        <h1 style={{ margin: 0 }}>Dodaj pacjenta</h1>
-        <Link href="/patients">← Wróć</Link>
-      </div>
+    <Stack spacing={3} sx={{ maxWidth: 560 }}>
+      <Stack direction="row" spacing={2} alignItems="center">
+        <SecondaryButton component={Link} href="/patients" variant="text">
+          ← Wróć
+        </SecondaryButton>
+        <Box>
+          <Typography variant="h5" fontWeight={700}>
+            Dodaj pacjenta
+          </Typography>
+          <Typography variant="body2" color="text.secondary">
+            Uzupełnij dane podstawowe i przejdź do karty pacjenta.
+          </Typography>
+        </Box>
+      </Stack>
 
-      <form onSubmit={onSubmit} style={{ marginTop: 16, display: "grid", gap: 12 }}>
-        <label style={{ display: "grid", gap: 6 }}>
-          <span>Imię pacjenta *</span>
-          <input
+      <SectionCard
+        title="Dane pacjenta"
+        subtitle="Uzupełnij podstawowe informacje."
+        icon={<PersonAddOutlinedIcon />}
+      >
+        <FormStack component="form" onSubmit={onSubmit}>
+          <TextField
+            label="Imię pacjenta"
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="np. Figa"
-            style={{ padding: 10, borderRadius: 8, border: "1px solid #333", background: "transparent" }}
+            required
+            fullWidth
           />
-        </label>
 
-        <label style={{ display: "grid", gap: 6 }}>
-          <span>Gatunek *</span>
-          <input
+          <TextField
+            label="Gatunek"
             value={species}
             onChange={(e) => setSpecies(e.target.value)}
             placeholder="np. pies / kot"
-            style={{ padding: 10, borderRadius: 8, border: "1px solid #333", background: "transparent" }}
+            required
+            fullWidth
           />
-        </label>
 
-        <label style={{ display: "grid", gap: 6 }}>
-          <span>Rasa</span>
-          <input
+          <TextField
+            label="Rasa"
             value={breed}
             onChange={(e) => setBreed(e.target.value)}
             placeholder="opcjonalnie"
-            style={{ padding: 10, borderRadius: 8, border: "1px solid #333", background: "transparent" }}
+            fullWidth
           />
-        </label>
 
-        <label style={{ display: "grid", gap: 6 }}>
-          <span>Właściciel</span>
-          <input
+          <TextField
+            label="Właściciel"
             value={ownerName}
             onChange={(e) => setOwnerName(e.target.value)}
             placeholder="opcjonalnie"
-            style={{ padding: 10, borderRadius: 8, border: "1px solid #333", background: "transparent" }}
+            fullWidth
           />
-        </label>
 
-        <button
-          type="submit"
-          disabled={saving}
-          style={{
-            padding: 12,
-            borderRadius: 10,
-            border: "1px solid #333",
-            background: saving ? "rgba(255,255,255,0.06)" : "rgba(255,255,255,0.12)",
-            cursor: saving ? "not-allowed" : "pointer",
-          }}
-        >
-          {saving ? "Zapisywanie..." : "Zapisz pacjenta"}
-        </button>
+          <PrimaryButton type="submit" size="large" disabled={saving}>
+            {saving ? "Zapisywanie..." : "Zapisz pacjenta"}
+          </PrimaryButton>
 
-        {error && <p style={{ color: "tomato", margin: 0 }}>Błąd: {error}</p>}
-        {ok && <p style={{ color: "lightgreen", margin: 0 }}>{ok}</p>}
-      </form>
-    </div>
+          {error && (
+            <Typography color="error" variant="body2">
+              Błąd: {error}
+            </Typography>
+          )}
+          {ok && (
+            <Typography color="success.main" variant="body2">
+              {ok}
+            </Typography>
+          )}
+        </FormStack>
+      </SectionCard>
+    </Stack>
   );
 }

@@ -3,6 +3,27 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 
+import {
+  Alert,
+  Box,
+  Checkbox,
+  Chip,
+  FormControlLabel,
+  Grid,
+  Paper,
+  Stack,
+  TextField,
+  Typography,
+} from "@mui/material";
+import SectionCard from "@/app/_components/SectionCard";
+import { PrimaryButton, SecondaryButton } from "@/app/_components/Buttons";
+import AutoAwesomeOutlinedIcon from "@mui/icons-material/AutoAwesomeOutlined";
+import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
+import MicOutlinedIcon from "@mui/icons-material/MicOutlined";
+import CloudUploadOutlinedIcon from "@mui/icons-material/CloudUploadOutlined";
+import GraphicEqOutlinedIcon from "@mui/icons-material/GraphicEqOutlined";
+import FolderOutlinedIcon from "@mui/icons-material/FolderOutlined";
+import ContentCopyOutlinedIcon from "@mui/icons-material/ContentCopyOutlined";
 import { doc, getDoc, serverTimestamp, updateDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase/client";
 import { getMyClinicId } from "@/lib/firebase/user";
@@ -164,24 +185,11 @@ function pipelineLabel(step: PipelineStep) {
   }
 }
 
-function tone(kind: "neutral" | "ok" | "warn" | "bad") {
-  switch (kind) {
-    case "ok":
-      return "border-green-200 bg-green-50 text-green-800";
-    case "warn":
-      return "border-amber-200 bg-amber-50 text-amber-800";
-    case "bad":
-      return "border-red-200 bg-red-50 text-red-800";
-    default:
-      return "border-slate-200 bg-slate-50 text-slate-700";
-  }
-}
-
-function stepTone(done: boolean, active: boolean, blocked: boolean) {
-  if (done) return tone("ok");
-  if (active) return tone("warn");
-  if (blocked) return tone("bad");
-  return tone("neutral");
+function stepChipColor(done: boolean, active: boolean, blocked: boolean) {
+  if (done) return "success";
+  if (active) return "warning";
+  if (blocked) return "error";
+  return "default";
 }
 
 export default function ExamPage() {
@@ -219,6 +227,7 @@ export default function ExamPage() {
   const [err, setErr] = useState("");
   const [okMsg, setOkMsg] = useState("");
   const [showRaw, setShowRaw] = useState(false);
+  const [showTranscriptSection, setShowTranscriptSection] = useState(false);
 
   // Raport
   const [generatingReport, setGeneratingReport] = useState(false);
@@ -971,60 +980,64 @@ export default function ExamPage() {
   const analyzeBlocked = !stepTranscriptDone;
   const reportBlocked = !stepAnalysisDone;
 
-  const pipelineTone =
-    pipelineStep === "error"
-      ? tone("bad")
-      : pipelineStep === "done"
-      ? tone("ok")
-      : pipelineStep === "idle"
-      ? tone("neutral")
-      : tone("warn");
-
-  const qualityTone =
-    typeof qualityScore === "number"
-      ? qualityScore < 60
-        ? tone("bad")
-        : qualityScore < 75
-        ? tone("warn")
-        : tone("ok")
-      : tone("neutral");
-
   return (
-    <div className="space-y-5">
+    <Stack spacing={3}>
       {(err || okMsg) && (
-        <div className="space-y-2">
+        <Stack spacing={1.5}>
           {err && (
-            <div className="rounded-2xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">
-              <div className="font-semibold">Błąd</div>
-              <div className="mt-1 whitespace-pre-wrap">{err}</div>
-              {pipelineMsg ? <div className="mt-2 text-xs text-red-700">Pipeline: {pipelineMsg}</div> : null}
-            </div>
+            <Alert severity="error">
+              <Box>
+                <Typography fontWeight={600}>Błąd</Typography>
+                <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                  {err}
+                </Typography>
+                {pipelineMsg ? (
+                  <Typography variant="caption" color="error" sx={{ mt: 1, display: "block" }}>
+                    Pipeline: {pipelineMsg}
+                  </Typography>
+                ) : null}
+              </Box>
+            </Alert>
           )}
           {okMsg && (
-            <div className="rounded-2xl border border-green-200 bg-green-50 p-3 text-sm text-green-900">
-              <div className="font-semibold">OK</div>
-              <div className="mt-1 whitespace-pre-wrap">{okMsg}</div>
-            </div>
+            <Alert severity="success">
+              <Box>
+                <Typography fontWeight={600}>OK</Typography>
+                <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                  {okMsg}
+                </Typography>
+              </Box>
+            </Alert>
           )}
-        </div>
+        </Stack>
       )}
 
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <div className="text-xl font-semibold tracking-tight">{typeLabel(exam.type)}</div>
-          <div className="mt-1 text-xs text-slate-500">
-            Patient: <span className="font-mono">{patientIdFromParams}</span> • Exam:{" "}
-            <span className="font-mono">{examId}</span>
-          </div>
-        </div>
+      <Stack
+        direction={{ xs: "column", sm: "row" }}
+        spacing={2}
+        justifyContent="space-between"
+        alignItems={{ sm: "center" }}
+      >
+        <Box>
+          <Typography variant="h5" fontWeight={700}>
+            {typeLabel(exam.type)}
+          </Typography>
+          <Typography variant="caption" color="text.secondary">
+            Patient: <Box component="span" sx={{ fontFamily: "monospace" }}>{patientIdFromParams}</Box> • Exam:{" "}
+            <Box component="span" sx={{ fontFamily: "monospace" }}>{examId}</Box>
+          </Typography>
+        </Box>
 
-        <div className="flex items-center gap-2">
-          <span className={`rounded-full border px-2.5 py-1 text-xs ${tone(exam.status === "done" ? "ok" : "neutral")}`}>
-            Status: {exam.status === "draft" ? "Szkic" : exam.status === "in_progress" ? "W trakcie" : "Zakończone"}
-          </span>
+        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+          <Chip
+            size="small"
+            label={`Status: ${exam.status === "draft" ? "Szkic" : exam.status === "in_progress" ? "W trakcie" : "Zakończone"}`}
+            color={exam.status === "done" ? "success" : exam.status === "in_progress" ? "warning" : "default"}
+            variant="outlined"
+          />
 
-          <button
-            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50"
+          <SecondaryButton
+            size="small"
             onClick={() => {
               if (!backPid) {
                 setErr("Nie mogę wrócić — brak patientId.");
@@ -1034,350 +1047,489 @@ export default function ExamPage() {
             }}
           >
             Wróć
-          </button>
+          </SecondaryButton>
 
-          <button
-            className="rounded-xl border border-red-200 bg-white px-3 py-2 text-sm text-red-700 hover:bg-red-50 disabled:opacity-50"
+          <SecondaryButton
+            color="error"
+            size="small"
             onClick={deleteExamNow}
             disabled={uiLocked}
             title="Usuń badanie"
           >
             {deletingExam ? "Usuwam…" : "Usuń"}
-          </button>
-        </div>
-      </div>
+          </SecondaryButton>
+        </Stack>
+      </Stack>
 
-      <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepRecordingDone, activeRec, false)}`}>
-            Nagranie
-          </span>
-          <span
-            className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepTranscriptDone, activeTranscribe, transBlocked)}`}
-          >
-            Transkrypcja
-          </span>
-          <span
-            className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepAnalysisDone, activeAnalyze, analyzeBlocked)}`}
-          >
-            Analiza
-          </span>
-          <span
-            className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepReportDone, activeReport, reportBlocked)}`}
-          >
-            Raport
-          </span>
+      <Paper variant="outlined" sx={{ px: 3, py: 2 }}>
+        <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" alignItems="center">
+          <Chip
+            size="small"
+            label="Nagranie"
+            variant="outlined"
+            color={stepChipColor(stepRecordingDone, activeRec, false)}
+          />
+          <Chip
+            size="small"
+            label="Transkrypcja"
+            variant="outlined"
+            color={stepChipColor(stepTranscriptDone, activeTranscribe, transBlocked)}
+          />
+          <Chip
+            size="small"
+            label="Analiza"
+            variant="outlined"
+            color={stepChipColor(stepAnalysisDone, activeAnalyze, analyzeBlocked)}
+          />
+          <Chip
+            size="small"
+            label="Raport"
+            variant="outlined"
+            color={stepChipColor(stepReportDone, activeReport, reportBlocked)}
+          />
 
           {hasAnyAnalysis && (
-            <div className="ml-1 flex flex-wrap items-center gap-1 text-xs text-slate-500">
-              <span className="ml-1">• Kompletność:</span>
-              <span className={`rounded-full border px-2 py-0.5 ${missing?.reason ? tone("bad") : tone("ok")}`}>
-                Powód
-              </span>
-              <span className={`rounded-full border px-2 py-0.5 ${missing?.findings ? tone("bad") : tone("ok")}`}>
-                Opis
-              </span>
-              <span className={`rounded-full border px-2 py-0.5 ${missing?.conclusions ? tone("bad") : tone("ok")}`}>
-                Wnioski
-              </span>
-              <span
-                className={`rounded-full border px-2 py-0.5 ${missing?.recommendations ? tone("bad") : tone("ok")}`}
-              >
-                Zalecenia
-              </span>
-            </div>
+            <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+              <Typography variant="caption" color="text.secondary">
+                • Kompletność:
+              </Typography>
+              <Chip
+                size="small"
+                label="Powód"
+                color={missing?.reason ? "error" : "success"}
+                variant="outlined"
+              />
+              <Chip
+                size="small"
+                label="Opis"
+                color={missing?.findings ? "error" : "success"}
+                variant="outlined"
+              />
+              <Chip
+                size="small"
+                label="Wnioski"
+                color={missing?.conclusions ? "error" : "success"}
+                variant="outlined"
+              />
+              <Chip
+                size="small"
+                label="Zalecenia"
+                color={missing?.recommendations ? "error" : "success"}
+                variant="outlined"
+              />
+            </Stack>
           )}
-        </div>
-      </div>
+        </Stack>
+      </Paper>
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">
-        <div className="lg:col-span-2">
-          <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm space-y-5">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <div className="text-sm font-semibold">Proces</div>
-                <div className="mt-1 text-xs text-slate-500">Nagranie → transkrypcja → facts → impression → analiza → raport(v2)</div>
-              </div>
+      <SectionCard
+        title="Proces badania"
+        subtitle="Nagranie, import i plik nagrania w jednym miejscu."
+        icon={<AutoAwesomeOutlinedIcon />}
+        actions={
+          <PrimaryButton
+            size="small"
+            onClick={runAutoReportPipeline}
+            disabled={uiLocked || (!hasLocalRecording && !exam?.transcript && !exam?.analysis?.sections)}
+            title={
+              !hasLocalRecording && !exam?.transcript && !exam?.analysis?.sections
+                ? "Najpierw dodaj nagranie"
+                : ""
+            }
+          >
+            {pipelineStep !== "idle" && pipelineStep !== "done" && pipelineStep !== "error"
+              ? pipelineLabel(pipelineStep)
+              : "Generuj raport"}
+          </PrimaryButton>
+        }
+      >
+        <Grid container spacing={3} alignItems="stretch">
+          <Grid item xs={12} md={6} sx={{ display: "flex" }}>
+            <Paper
+              variant="outlined"
+              sx={{
+                p: 2,
+                bgcolor: "background.default",
+                minHeight: { xs: 260, md: 300 },
+                height: "100%",
+                width: "100%",
+                flex: 1,
+              }}
+            >
+              <Stack spacing={2}>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <MicOutlinedIcon fontSize="small" />
+                  <Typography fontWeight={600}>Nagrywanie</Typography>
+                </Stack>
+                <Typography variant="body2" sx={{ fontFamily: "monospace" }}>
+                  {fmtMs(elapsedMs)}
+                </Typography>
 
-              <button
-                className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
-                onClick={runAutoReportPipeline}
-                disabled={uiLocked || (!hasLocalRecording && !exam?.transcript && !exam?.analysis?.sections)}
-                title={!hasLocalRecording && !exam?.transcript && !exam?.analysis?.sections ? "Najpierw dodaj nagranie" : ""}
+                <Stack direction="row" spacing={1} flexWrap="wrap">
+                  <PrimaryButton size="small" disabled={!canStart} onClick={startRecording}>
+                    Start
+                  </PrimaryButton>
+                  <SecondaryButton size="small" disabled={!canPause} onClick={pauseRecording}>
+                    Pauza
+                  </SecondaryButton>
+                  <SecondaryButton size="small" disabled={!canResume} onClick={resumeRecording}>
+                    Wznów
+                  </SecondaryButton>
+                  <SecondaryButton size="small" disabled={!canStop} onClick={stopRecording}>
+                    Stop
+                  </SecondaryButton>
+                </Stack>
+
+                {recordedUrl && (
+                  <Stack spacing={1}>
+                    <audio controls src={recordedUrl} className="w-full" />
+                    <Typography variant="caption" color="text.secondary">
+                      MIME: <span className="font-mono">{recordedMime}</span> • Rozmiar:{" "}
+                      <span className="font-mono">{recordedBlob?.size ?? 0}</span> B
+                    </Typography>
+                  </Stack>
+                )}
+
+                <Stack spacing={1}>
+                  <SecondaryButton size="small" disabled={!canSave} onClick={saveRecordingLocal}>
+                    {savingAudio ? "Zapisuję…" : "Zapisz nagranie"}
+                  </SecondaryButton>
+                  <Typography variant="caption" color="text.secondary">
+                    Zapis lokalny jest wymagany do transkrypcji.
+                  </Typography>
+                </Stack>
+              </Stack>
+            </Paper>
+          </Grid>
+
+          <Grid item xs={12} md={6} sx={{ display: "flex" }}>
+            <Paper
+              variant="outlined"
+              sx={{
+                p: 2,
+                bgcolor: "background.default",
+                minHeight: { xs: 260, md: 300 },
+                height: "100%",
+                width: "100%",
+                flex: 1,
+              }}
+            >
+              <Stack spacing={1.5}>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <FolderOutlinedIcon fontSize="small" />
+                  <Typography fontWeight={600}>Plik nagrania</Typography>
+                </Stack>
+                {hasLocalRecording ? (
+                  <>
+                    <audio
+                      controls
+                      className="w-full"
+                      src={`/api/recordings/file?path=${encodeURIComponent(exam.recording!.localPath!)}`}
+                    />
+                    <Stack direction="row" spacing={1} alignItems="center">
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        sx={{
+                          fontFamily: "monospace",
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          flex: 1,
+                        }}
+                      >
+                        {exam.recording!.localPath}
+                      </Typography>
+                      <SecondaryButton
+                        size="small"
+                        onClick={async () => {
+                          try {
+                            await navigator.clipboard.writeText(
+                              exam.recording!.localPath
+                            );
+                            setOkMsg("Skopiowano ścieżkę nagrania.");
+                          } catch {}
+                        }}
+                        startIcon={<ContentCopyOutlinedIcon fontSize="small" />}
+                      >
+                        Kopiuj
+                      </SecondaryButton>
+                    </Stack>
+                    {exam.recording?.preprocessedLocalPath ? (
+                      <Typography variant="caption" color="text.secondary">
+                        Plik oczyszczony zapisany.
+                      </Typography>
+                    ) : null}
+                  </>
+                ) : (
+                  <Typography variant="caption" color="text.secondary">
+                    Brak nagrania.
+                  </Typography>
+                )}
+              </Stack>
+            </Paper>
+          </Grid>
+
+          <Grid item xs={12} md={6} sx={{ display: "flex" }}>
+            <Paper
+              variant="outlined"
+              sx={{
+                p: 2,
+                bgcolor: "background.default",
+                minHeight: { xs: 260, md: 300 },
+                height: "100%",
+                width: "100%",
+                flex: 1,
+              }}
+            >
+              <Stack spacing={2}>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <CloudUploadOutlinedIcon fontSize="small" />
+                  <Typography fontWeight={600}>Import nagrania</Typography>
+                </Stack>
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  sx={{
+                    display: "-webkit-box",
+                    WebkitLineClamp: 2,
+                    WebkitBoxOrient: "vertical",
+                    overflow: "hidden",
+                  }}
+                >
+                  Wgraj gotowy plik audio (mp3, m4a, wav, ogg, webm). Zostanie zapisany lokalnie i podpięty do badania.
+                </Typography>
+
+                <Stack spacing={1.5}>
+                  <SecondaryButton component="label" size="small" disabled={uiLocked}>
+                    Wybierz plik audio
+                    <input
+                      type="file"
+                      accept="audio/*"
+                      hidden
+                      onChange={(e) => {
+                        const f = e.target.files?.[0] || null;
+                        setImportFile(f);
+                      }}
+                    />
+                  </SecondaryButton>
+
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={importRunPipeline}
+                        onChange={(e) => setImportRunPipeline(e.target.checked)}
+                        disabled={uiLocked}
+                      />
+                    }
+                    label="Automatycznie uruchom generowanie raportu"
+                  />
+
+                  <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+                    <SecondaryButton
+                      size="small"
+                      disabled={uiLocked || !importFile}
+                      onClick={importRecordingFile}
+                    >
+                      {importing ? "Importuję…" : "Wgraj do badania"}
+                    </SecondaryButton>
+
+                    <Typography variant="caption" color="text.secondary">
+                      {importFile
+                        ? `Wybrano: ${importFile.name} • ${Math.round(importFile.size / 1024)} KB`
+                        : "Nie wybrano pliku"}
+                    </Typography>
+                  </Stack>
+                </Stack>
+              </Stack>
+            </Paper>
+          </Grid>
+
+          <Grid item xs={12} md={6} sx={{ display: "flex" }}>
+            <Paper
+              variant="outlined"
+              sx={{
+                p: 2,
+                bgcolor: "background.default",
+                minHeight: { xs: 260, md: 300 },
+                height: "100%",
+                width: "100%",
+                flex: 1,
+              }}
+            >
+              <Stack spacing={1.5}>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <GraphicEqOutlinedIcon fontSize="small" />
+                  <Typography fontWeight={600}>Transkrypcja</Typography>
+                </Stack>
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  sx={{
+                    display: "-webkit-box",
+                    WebkitLineClamp: 2,
+                    WebkitBoxOrient: "vertical",
+                    overflow: "hidden",
+                  }}
+                >
+                  Włącz podgląd transkrypcji w osobnej sekcji.
+                </Typography>
+                <SecondaryButton
+                  size="small"
+                  onClick={() => setShowTranscriptSection((v) => !v)}
+                >
+                  {showTranscriptSection ? "Ukryj transkrypcję" : "Zobacz transkrypcję"}
+                </SecondaryButton>
+              </Stack>
+            </Paper>
+          </Grid>
+        </Grid>
+      </SectionCard>
+
+      {showTranscriptSection && (hasLocalRecording || hasTranscript) && (
+        <SectionCard
+          title="Transkrypcja"
+          subtitle="Czysta / surowa transkrypcja oraz narzędzia analizy."
+          icon={<GraphicEqOutlinedIcon />}
+          sx={{ width: "100%" }}
+        >
+          <Stack spacing={2}>
+            <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+              <PrimaryButton
+                size="small"
+                onClick={transcribeNow}
+                disabled={uiLocked || !hasLocalRecording}
+                title={!hasLocalRecording ? "Brak lokalnego nagrania" : ""}
               >
-                {pipelineStep !== "idle" && pipelineStep !== "done" && pipelineStep !== "error"
-                  ? pipelineLabel(pipelineStep)
-                  : "Generuj raport"}
-              </button>
-            </div>
+                {transcribing ? "Transkrybuję…" : "Transkrybuj"}
+              </PrimaryButton>
 
-            {/* Nagrywanie */}
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <div className="text-sm font-semibold">Nagrywanie</div>
-                <div className="text-sm font-mono text-slate-700">{fmtMs(elapsedMs)}</div>
-              </div>
+              <SecondaryButton
+                size="small"
+                onClick={analyzeNow}
+                disabled={uiLocked || !exam?.transcript}
+                title={!exam?.transcript ? "Brak transkrypcji" : ""}
+              >
+                Analizuj (v2)
+              </SecondaryButton>
 
-              <div className="flex flex-wrap gap-2 items-center">
-                <button
-                  className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
-                  disabled={!canStart}
-                  onClick={startRecording}
-                >
-                  Start
-                </button>
+              <SecondaryButton
+                size="small"
+                variant={!showRaw ? "contained" : "outlined"}
+                onClick={() => setShowRaw(false)}
+                disabled={!exam.transcript}
+              >
+                Czyste
+              </SecondaryButton>
+              <SecondaryButton
+                size="small"
+                variant={showRaw ? "contained" : "outlined"}
+                onClick={() => setShowRaw(true)}
+                disabled={!exam.transcriptRaw}
+              >
+                Surowe
+              </SecondaryButton>
 
-                <button
-                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-                  disabled={!canPause}
-                  onClick={pauseRecording}
-                >
-                  Pauza
-                </button>
-
-                <button
-                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-                  disabled={!canResume}
-                  onClick={resumeRecording}
-                >
-                  Wznów
-                </button>
-
-                <button
-                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-                  disabled={!canStop}
-                  onClick={stopRecording}
-                >
-                  Stop
-                </button>
-              </div>
-
-              {recordedUrl && (
-                <div className="space-y-2">
-                  <audio controls src={recordedUrl} className="w-full" />
-                  <div className="text-xs text-slate-500">
-                    MIME: <span className="font-mono">{recordedMime}</span> • Rozmiar:{" "}
-                    <span className="font-mono">{recordedBlob?.size ?? 0}</span> B
-                  </div>
-                </div>
+              {typeof qualityScore === "number" && (
+                <Chip
+                  size="small"
+                  label={`Jakość: ${qualityScore}/100${wasPreprocessed ? " • po czyszczeniu" : ""}`}
+                  variant="outlined"
+                  color={qualityScore < 60 ? "error" : qualityScore < 75 ? "warning" : "success"}
+                />
               )}
 
-              <div className="pt-1">
-                <button
-                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-                  disabled={!canSave}
-                  onClick={saveRecordingLocal}
+              {isQualityLow && (
+                <PrimaryButton
+                  size="small"
+                  disabled={uiLocked || preprocessing || !hasLocalRecording}
+                  onClick={preprocessAndRetranscribe}
+                  title="Odszumianie + normalizacja głośności + ponowna transkrypcja"
                 >
-                  {savingAudio ? "Zapisuję…" : "Zapisz nagranie"}
-                </button>
-                <div className="mt-2 text-xs text-slate-500">Zapis lokalny jest wymagany do transkrypcji (localPath).</div>
-              </div>
-            </div>
+                  {preprocessing ? "Oczyszczam…" : "Oczyść i ponów"}
+                </PrimaryButton>
+              )}
+            </Stack>
 
-            {/* Import */}
-            <div className="space-y-3">
-              <div className="text-sm font-semibold">Import nagrania</div>
-              <div className="text-xs text-slate-500">
-                Wgraj gotowy plik audio (mp3, m4a, wav, ogg, webm). Zostanie zapisany lokalnie i podpięty do badania.
-              </div>
-
-              <div className="grid gap-2">
-                <input
-                  type="file"
-                  accept="audio/*"
-                  disabled={uiLocked}
-                  onChange={(e) => {
-                    const f = e.target.files?.[0] || null;
-                    setImportFile(f);
-                  }}
-                  className="block w-full text-sm file:mr-3 file:rounded-xl file:border file:border-slate-200 file:bg-white file:px-3 file:py-2 file:text-sm file:hover:bg-slate-50"
-                />
-
-                <label className="flex items-center gap-2 text-sm text-slate-700 select-none">
-                  <input
-                    type="checkbox"
-                    checked={importRunPipeline}
-                    onChange={(e) => setImportRunPipeline(e.target.checked)}
-                    disabled={uiLocked}
-                  />
-                  Po imporcie uruchom pipeline v2 (transkrypcja → facts → impression → analiza → raport)
-                </label>
-
-                <div className="flex items-center gap-2">
-                  <button
-                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-                    disabled={uiLocked || !importFile}
-                    onClick={importRecordingFile}
-                  >
-                    {importing ? "Importuję…" : "Wgraj do badania"}
-                  </button>
-
-                  {importFile ? (
-                    <div className="text-xs text-slate-500 truncate">
-                      Wybrano: <span className="font-mono">{importFile.name}</span> • {Math.round(importFile.size / 1024)} KB
-                    </div>
-                  ) : (
-                    <div className="text-xs text-slate-500">Nie wybrano pliku</div>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {hasLocalRecording && (
-              <div className="space-y-2">
-                <div className="text-sm font-semibold">Plik nagrania</div>
-                <audio
-                  controls
-                  className="w-full"
-                  src={`/api/recordings/file?path=${encodeURIComponent(exam.recording!.localPath!)}`}
-                />
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs">
-                  <div>
-                    Path: <span className="font-mono break-all">{exam.recording!.localPath}</span>
-                  </div>
-
-                  {exam.recording?.preprocessedLocalPath ? (
-                    <div className="mt-2">
-                      Clean: <span className="font-mono break-all">{exam.recording.preprocessedLocalPath}</span>
-                    </div>
-                  ) : null}
-                </div>
-              </div>
+            {transcriptToShow ? (
+              <Paper
+                variant="outlined"
+                sx={{ p: 2, bgcolor: "background.default", maxHeight: 260, overflow: "auto" }}
+              >
+                <Typography variant="caption" sx={{ whiteSpace: "pre-wrap" }}>
+                  {transcriptToShow}
+                </Typography>
+              </Paper>
+            ) : (
+              <Typography variant="body2" color="text.secondary">
+                Brak transkrypcji — kliknij „Transkrybuj”.
+              </Typography>
             )}
+          </Stack>
+        </SectionCard>
+      )}
 
-            {(hasLocalRecording || hasTranscript) && (
-              <div className="space-y-3">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="text-sm font-semibold">Transkrypcja</div>
+      <SectionCard
+        title="Raport"
+        subtitle="Edytuj ręcznie i zapisz do badania."
+        icon={<DescriptionOutlinedIcon />}
+        sx={{ width: "100%" }}
+      >
+        <Stack spacing={2}>
+          <Stack
+            direction={{ xs: "column", sm: "row" }}
+            spacing={2}
+            justifyContent="space-between"
+            alignItems={{ sm: "center" }}
+          >
+            <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+              <Chip size="small" label={pipelineLabel(pipelineStep)} variant="outlined" />
+              <PrimaryButton size="small" onClick={saveReport} disabled={uiLocked}>
+                {savingReport ? "Zapisuję…" : "Zapisz"}
+              </PrimaryButton>
+              <SecondaryButton
+                size="small"
+                onClick={generateReportNow}
+                disabled={uiLocked}
+                title="Generuj raport v2 na nowo i nadpisz draft"
+              >
+                {generatingReport ? "Generuję…" : "Odśwież (v2)"}
+              </SecondaryButton>
+            </Stack>
+          </Stack>
 
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      className={`rounded-full border px-2 py-0.5 text-xs ${
-                        !showRaw ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-700 border-slate-200"
-                      }`}
-                      onClick={() => setShowRaw(false)}
-                      disabled={!exam.transcript}
-                      type="button"
-                    >
-                      Czyste
-                    </button>
-                    <button
-                      className={`rounded-full border px-2 py-0.5 text-xs ${
-                        showRaw ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-700 border-slate-200"
-                      }`}
-                      onClick={() => setShowRaw(true)}
-                      disabled={!exam.transcriptRaw}
-                      type="button"
-                    >
-                      Surowe
-                    </button>
-                  </div>
-                </div>
+          <TextField
+            multiline
+            minRows={20}
+            value={reportDraft}
+            onChange={(e) => {
+              setReportDraft(e.target.value);
+              reportDirtyRef.current = true;
+              setReportDirty(true);
+            }}
+            placeholder="Tu pojawi się raport. Możesz go edytować ręcznie."
+            fullWidth
+          />
 
-                <div className="flex flex-wrap gap-2 items-center">
-                  <button
-                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-                    onClick={transcribeNow}
-                    disabled={uiLocked || !hasLocalRecording}
-                    title={!hasLocalRecording ? "Brak lokalnego nagrania" : ""}
-                  >
-                    {transcribing ? "Transkrybuję…" : "Transkrybuj"}
-                  </button>
+          <Stack direction="row" justifyContent="space-between" alignItems="center">
+            <Typography variant="caption" color="text.secondary">
+              {reportDirty ? "Masz niezapisane zmiany." : "—"}
+            </Typography>
+            <Typography variant="caption" sx={{ fontFamily: "monospace" }}>
+              {reportDraft.length} znaków
+            </Typography>
+          </Stack>
 
-                  <button
-                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-                    onClick={analyzeNow}
-                    disabled={uiLocked || !exam?.transcript}
-                    title={!exam?.transcript ? "Brak transkrypcji" : ""}
-                  >
-                    Analizuj (v2)
-                  </button>
-
-                  {typeof qualityScore === "number" && (
-                    <span
-                      className={`rounded-full border px-2.5 py-1 text-xs ${qualityTone}`}
-                      title={qualityFlags.length ? `Flagi: ${qualityFlags.join(", ")}` : ""}
-                    >
-                      Jakość: {qualityScore}/100{wasPreprocessed ? " • po czyszczeniu" : ""}
-                    </span>
-                  )}
-
-                  {isQualityLow && (
-                    <button
-                      className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800 disabled:opacity-50"
-                      disabled={uiLocked || preprocessing || !hasLocalRecording}
-                      onClick={preprocessAndRetranscribe}
-                      title="Odszumianie + normalizacja głośności + ponowna transkrypcja"
-                    >
-                      {preprocessing ? "Oczyszczam…" : "Oczyść i ponów"}
-                    </button>
-                  )}
-
-                  <span className={`ml-auto rounded-full border px-2.5 py-1 text-xs ${pipelineTone}`}>
-                    Pipeline: {pipelineLabel(pipelineStep)}
-                  </span>
-                </div>
-
-                {transcriptToShow ? (
-                  <pre className="whitespace-pre-wrap rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs max-h-[280px] overflow-auto">
-                    {transcriptToShow}
-                  </pre>
-                ) : (
-                  <div className="text-sm text-slate-500">Brak transkrypcji — kliknij „Transkrybuj”.</div>
-                )}
-              </div>
-            )}
-          </section>
-        </div>
-
-        <div className="lg:col-span-3">
-          <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-md space-y-3">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <div className="text-sm font-semibold">Raport</div>
-                <div className="mt-1 text-xs text-slate-500">Edytuj ręcznie i zapisz do badania.</div>
-              </div>
-
-              <div className="flex items-center gap-2">
-                <span className={`rounded-full border px-2.5 py-1 text-xs ${pipelineTone}`}>{pipelineLabel(pipelineStep)}</span>
-
-                <button
-                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-                  onClick={saveReport}
-                  disabled={uiLocked}
-                >
-                  {savingReport ? "Zapisuję…" : "Zapisz"}
-                </button>
-
-                <button
-                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-                  onClick={generateReportNow}
-                  disabled={uiLocked}
-                  title="Generuj raport v2 na nowo i nadpisz draft"
-                >
-                  {generatingReport ? "Generuję…" : "Odśwież (v2)"}
-                </button>
-              </div>
-            </div>
-
-            <textarea
-              className="w-full rounded-xl border border-slate-200 bg-white p-3 text-sm min-h-[460px] focus:outline-none focus:ring-2 focus:ring-slate-200"
-              value={reportDraft}
-              onChange={(e) => {
-                setReportDraft(e.target.value);
-                reportDirtyRef.current = true;
-                setReportDirty(true);
-              }}
-              placeholder="Tu pojawi się raport. Możesz go edytować ręcznie."
-            />
-
-            <div className="text-xs text-slate-500 flex items-center justify-between">
-              <span>{reportDirty ? "Masz niezapisane zmiany." : "—"}</span>
-              <span className="font-mono">{reportDraft.length} znaków</span>
-            </div>
-          </section>
-        </div>
-      </div>
-    </div>
+          <Stack direction={{ xs: "column", sm: "row" }} spacing={2} alignItems="center">
+            <PrimaryButton size="medium">
+              Pobierz badanie (PDF/DOCX)
+            </PrimaryButton>
+            <SecondaryButton size="medium">
+              Eksportuj do Klinika XP
+            </SecondaryButton>
+          </Stack>
+        </Stack>
+      </SectionCard>
+    </Stack>
   );
 }

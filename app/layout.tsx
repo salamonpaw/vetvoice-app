@@ -1,4 +1,6 @@
 import AuthGate from "./_providers/AuthGate";
+import AppShell from "./_components/AppShell";
+import MuiThemeProvider from "./_providers/MuiThemeProvider";
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
@@ -30,19 +32,14 @@ export default function RootLayout({
           geistSans.variable,
           geistMono.variable,
           "antialiased",
-          // 👇 GLOBALNY APP SHELL
           "min-h-screen",
-          "bg-slate-50",
-          "text-slate-900",
         ].join(" ")}
       >
-        <AuthGate>
-          {/* APP CONTAINER */}
-          <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
-            {/* opcjonalny górny odstęp */}
-            <div className="py-6">{children}</div>
-          </div>
-        </AuthGate>
+        <MuiThemeProvider>
+          <AuthGate>
+            <AppShell>{children}</AppShell>
+          </AuthGate>
+        </MuiThemeProvider>
       </body>
     </html>
   );
