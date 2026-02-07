@@ -76,7 +76,18 @@ type ExamDoc = {
   };
 };
 
-type PipelineStep = "idle" | "transcribing" | "analyzing" | "generating" | "done" | "error";
+type PipelineStep =
+  | "idle"
+  | "transcribing"
+  | "facts"
+  | "impression"
+  | "analyzing"
+  | "generating"
+  | "done"
+  | "error";
+
+const DEFAULT_SANITIZE = true;
+const DEFAULT_USE_LLM_IN_REPORT = false;
 
 function fmtMs(ms: number) {
   const totalSec = Math.floor(ms / 1000);
@@ -110,12 +121,38 @@ async function readJsonOrText(res: Response) {
   return { kind: "text" as const, json: null, text };
 }
 
+async function postJSON(url: string, body: any) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  const parsed = await readJsonOrText(res);
+  const json = (parsed.kind === "json" ? parsed.json : null) as any;
+
+  if (!res.ok || !json?.ok) {
+    const msg =
+      json?.error ||
+      json?.warning ||
+      `HTTP ${res.status} ${res.statusText}\n${(parsed.text || "").slice(0, 800)}`;
+
+    throw new Error(msg);
+  }
+
+  return json;
+}
+
 function pipelineLabel(step: PipelineStep) {
   switch (step) {
     case "idle":
       return "—";
     case "transcribing":
       return "Transkrypcja…";
+    case "facts":
+      return "Fakty…";
+    case "impression":
+      return "Impresja…";
     case "analyzing":
       return "Analiza…";
     case "generating":
@@ -587,18 +624,7 @@ export default function ExamPage() {
 
     setTranscribing(true);
     try {
-      const res = await fetch("/api/exams/transcribe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ patientId: patientIdFromParams, examId }),
-      });
-
-      const parsed = await readJsonOrText(res);
-      const json = (parsed.kind === "json" ? parsed.json : null) as any;
-
-      if (!res.ok || !json?.ok) {
-        throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`);
-      }
+      await postJSON("/api/exams/transcribe", { patientId: patientIdFromParams, examId });
 
       await load();
       setOkMsg("✅ Transkrypcja gotowa");
@@ -627,39 +653,16 @@ export default function ExamPage() {
 
     setPreprocessing(true);
     try {
-      const pRes = await fetch("/api/exams/preprocess-audio", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ patientId: patientIdFromParams, examId }),
+      await postJSON("/api/exams/preprocess-audio", {
+        patientId: patientIdFromParams,
+        examId,
       });
 
-      const pParsed = await readJsonOrText(pRes);
-      const pJson = (pParsed.kind === "json" ? pParsed.json : null) as any;
-
-      if (!pRes.ok || !pJson?.ok) {
-        throw new Error(
-          pJson?.error || `Preprocess: HTTP ${pRes.status} ${pRes.statusText}\n${pParsed.text.slice(0, 800)}`
-        );
-      }
-
-      const tRes = await fetch("/api/exams/transcribe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          patientId: patientIdFromParams,
-          examId,
-          usePreprocessed: true,
-        }),
+      await postJSON("/api/exams/transcribe", {
+        patientId: patientIdFromParams,
+        examId,
+        usePreprocessed: true,
       });
-
-      const tParsed = await readJsonOrText(tRes);
-      const tJson = (tParsed.kind === "json" ? tParsed.json : null) as any;
-
-      if (!tRes.ok || !tJson?.ok) {
-        throw new Error(
-          tJson?.error || `Transkrypcja: HTTP ${tRes.status} ${tRes.statusText}\n${tParsed.text.slice(0, 800)}`
-        );
-      }
 
       await load();
       setOkMsg("✅ Oczyszczono nagranie i wykonano ponowną transkrypcję.");
@@ -671,7 +674,7 @@ export default function ExamPage() {
     }
   }
 
-  // ✅ POPRAWIONE: timeout/warning nie wywala runtime errora (nie robimy throw)
+  // Analiza teraz robi: extract-facts + extract-impression + analyze(sanitize)
   async function analyzeNow() {
     setErr("");
     setOkMsg("");
@@ -687,24 +690,29 @@ export default function ExamPage() {
       return;
     }
 
-    const cid = getCidFromStateOrExam(fresh);
+    try {
+      setPipelineStep("facts");
+      await postJSON("/api/exams/extract-facts", { patientId: patientIdFromParams, examId });
 
-    const res = await fetch("/api/exams/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clinicId: cid, patientId: patientIdFromParams, examId }),
-    });
+      setPipelineStep("impression");
+      await postJSON("/api/exams/extract-impression", { patientId: patientIdFromParams, examId });
 
-    const parsed = await readJsonOrText(res);
-    const json = (parsed.kind === "json" ? parsed.json : null) as any;
+      setPipelineStep("analyzing");
+      const cid = getCidFromStateOrExam(fresh);
 
-    // ⚠ Soft-fail: timeout / warning -> pokaż komunikat i nie wywalaj runtime errora
-    if (!res.ok || !json?.ok) {
-      const msg =
-        json?.error ||
-        json?.warning ||
-        `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`;
+      await postJSON("/api/exams/analyze", {
+        clinicId: cid,
+        patientId: patientIdFromParams,
+        examId,
+        sanitize: DEFAULT_SANITIZE,
+      });
 
+      await load();
+      setOkMsg("✅ Analiza gotowa");
+    } catch (e: any) {
+      const msg = e?.message || "Błąd analizy";
+
+      // Soft-fail: timeout / abort -> nie zabijaj UI
       const looksLikeTimeout =
         typeof msg === "string" &&
         (msg.toLowerCase().includes("timeout") ||
@@ -712,20 +720,21 @@ export default function ExamPage() {
           msg.toLowerCase().includes("abort"));
 
       if (looksLikeTimeout) {
-        setErr(""); // nie traktujemy jako twardy błąd UI
+        setErr("");
         setOkMsg(`⚠ Analiza nie zdążyła się zakończyć: ${msg}\nUżywam poprzednich danych (jeśli istnieją).`);
         await load();
         return;
       }
 
-      throw new Error(msg);
+      setErr(msg);
+      setOkMsg("");
+      throw e;
+    } finally {
+      if (pipelineStep !== "error") setPipelineStep("idle");
     }
-
-    await load();
-    setOkMsg("✅ Analiza gotowa");
   }
 
-  // ✅ KLUCZOWA ZMIANA: "Odśwież" zawsze nadpisuje draft raportem z Firestore (pełnym), a nie preview
+  // Odśwież raport: generate-report-v2 (sanitize + useLLM)
   async function generateReportNow() {
     setErr("");
     setOkMsg("");
@@ -740,22 +749,13 @@ export default function ExamPage() {
       const freshBefore = await fetchFreshExam();
       const cid = getCidFromStateOrExam(freshBefore);
 
-      const res = await fetch("/api/exams/generate-report", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          clinicId: cid,
-          patientId: patientIdFromParams,
-          examId,
-        }),
+      await postJSON("/api/exams/generate-report-v2", {
+        clinicId: cid,
+        patientId: patientIdFromParams,
+        examId,
+        sanitize: DEFAULT_SANITIZE,
+        useLLM: DEFAULT_USE_LLM_IN_REPORT,
       });
-
-      const parsed = await readJsonOrText(res);
-      const json = (parsed.kind === "json" ? parsed.json : null) as any;
-
-      if (!res.ok || !json?.ok) {
-        throw new Error(json?.error || `HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 800)}`);
-      }
 
       await load();
       const freshAfter = await fetchFreshExam();
@@ -766,7 +766,7 @@ export default function ExamPage() {
       reportDirtyRef.current = false;
       setReportDirty(false);
 
-      setOkMsg("✅ Raport wygenerowany (nadpisano draft)");
+      setOkMsg("✅ Raport wygenerowany (v2, nadpisano draft)");
     } catch (e: any) {
       setErr(e?.message || "Błąd generowania raportu");
       setOkMsg("");
@@ -775,6 +775,7 @@ export default function ExamPage() {
     }
   }
 
+  // Pipeline v2: transcribe -> facts -> impression -> analyze -> report-v2
   async function runAutoReportPipeline() {
     setErr("");
     setOkMsg("");
@@ -789,6 +790,7 @@ export default function ExamPage() {
       let fresh = await fetchFreshExam();
       if (!fresh) throw new Error("Brak badania (nie znaleziono dokumentu w Firestore).");
 
+      // 1) Transkrypcja (jeśli brak)
       if (!fresh.transcript || !fresh.transcript.trim()) {
         if (!fresh.recording?.localPath) {
           throw new Error("Brak transkrypcji i brak lokalnego nagrania (recording.localPath).");
@@ -797,20 +799,7 @@ export default function ExamPage() {
         setPipelineStep("transcribing");
         setTranscribing(true);
 
-        const res = await fetch("/api/exams/transcribe", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ patientId: patientIdFromParams, examId }),
-        });
-
-        const parsed = await readJsonOrText(res);
-        const json = (parsed.kind === "json" ? parsed.json : null) as any;
-
-        if (!res.ok || !json?.ok) {
-          throw new Error(
-            json?.error || `Transkrypcja: HTTP ${res.status} ${res.statusText}\n${parsed.text.slice(0, 400)}`
-          );
-        }
+        await postJSON("/api/exams/transcribe", { patientId: patientIdFromParams, examId });
 
         await load();
         fresh = await fetchFreshExam();
@@ -819,24 +808,47 @@ export default function ExamPage() {
         }
       }
 
-      if (!fresh.analysis?.sections) {
-        setPipelineStep("analyzing");
-        await analyzeNow();
+      // 2) Facts
+      setPipelineStep("facts");
+      await postJSON("/api/exams/extract-facts", { patientId: patientIdFromParams, examId });
 
-        fresh = await fetchFreshExam();
-        if (!fresh?.analysis?.sections) {
-          // analiza mogła timeoutować; pipeline ma prawo zatrzymać się tu
-          throw new Error("Analiza nie została zapisana (sprawdź /api/exams/analyze).");
-        }
-      }
+      // 3) Impression
+      setPipelineStep("impression");
+      await postJSON("/api/exams/extract-impression", { patientId: patientIdFromParams, examId });
 
+      // 4) Analyze
+      setPipelineStep("analyzing");
+      const cid = getCidFromStateOrExam(fresh);
+      await postJSON("/api/exams/analyze", {
+        clinicId: cid,
+        patientId: patientIdFromParams,
+        examId,
+        sanitize: DEFAULT_SANITIZE,
+      });
+
+      // 5) Report v2
       setPipelineStep("generating");
-      await generateReportNow();
+      await postJSON("/api/exams/generate-report-v2", {
+        clinicId: cid,
+        patientId: patientIdFromParams,
+        examId,
+        sanitize: DEFAULT_SANITIZE,
+        useLLM: DEFAULT_USE_LLM_IN_REPORT,
+      });
 
       await load();
 
+      const freshAfter = await fetchFreshExam();
+      const fullReport = (freshAfter?.report || "").toString();
+      if (fullReport) {
+        setReportDraft(fullReport);
+        reportDirtyRef.current = false;
+        setReportDirty(false);
+      }
+
       setPipelineStep("done");
       setPipelineMsg("Gotowe ✅");
+      setOkMsg("✅ Pipeline v2 zakończony");
     } catch (e: any) {
       setPipelineStep("error");
       setPipelineMsg(e?.message || "Błąd pipeline");
@@ -1040,23 +1052,39 @@ export default function ExamPage() {
           <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepRecordingDone, activeRec, false)}`}>
             Nagranie
           </span>
-          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepTranscriptDone, activeTranscribe, transBlocked)}`}>
+          <span
+            className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepTranscriptDone, activeTranscribe, transBlocked)}`}
+          >
             Transkrypcja
           </span>
-          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepAnalysisDone, activeAnalyze, analyzeBlocked)}`}>
+          <span
+            className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepAnalysisDone, activeAnalyze, analyzeBlocked)}`}
+          >
             Analiza
           </span>
-          <span className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepReportDone, activeReport, reportBlocked)}`}>
+          <span
+            className={`rounded-full border px-2.5 py-1 text-xs ${stepTone(stepReportDone, activeReport, reportBlocked)}`}
+          >
             Raport
           </span>
 
           {hasAnyAnalysis && (
             <div className="ml-1 flex flex-wrap items-center gap-1 text-xs text-slate-500">
               <span className="ml-1">• Kompletność:</span>
-              <span className={`rounded-full border px-2 py-0.5 ${missing?.reason ? tone("bad") : tone("ok")}`}>Powód</span>
-              <span className={`rounded-full border px-2 py-0.5 ${missing?.findings ? tone("bad") : tone("ok")}`}>Opis</span>
-              <span className={`rounded-full border px-2 py-0.5 ${missing?.conclusions ? tone("bad") : tone("ok")}`}>Wnioski</span>
-              <span className={`rounded-full border px-2 py-0.5 ${missing?.recommendations ? tone("bad") : tone("ok")}`}>Zalecenia</span>
+              <span className={`rounded-full border px-2 py-0.5 ${missing?.reason ? tone("bad") : tone("ok")}`}>
+                Powód
+              </span>
+              <span className={`rounded-full border px-2 py-0.5 ${missing?.findings ? tone("bad") : tone("ok")}`}>
+                Opis
+              </span>
+              <span className={`rounded-full border px-2 py-0.5 ${missing?.conclusions ? tone("bad") : tone("ok")}`}>
+                Wnioski
+              </span>
+              <span
+                className={`rounded-full border px-2 py-0.5 ${missing?.recommendations ? tone("bad") : tone("ok")}`}
+              >
+                Zalecenia
+              </span>
             </div>
           )}
         </div>
@@ -1068,7 +1096,7 @@ export default function ExamPage() {
             <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="text-sm font-semibold">Proces</div>
-                <div className="mt-1 text-xs text-slate-500">Nagranie → transkrypcja → analiza → raport</div>
+                <div className="mt-1 text-xs text-slate-500">Nagranie → transkrypcja → facts → impression → analiza → raport(v2)</div>
               </div>
 
               <button
@@ -1172,7 +1200,7 @@ export default function ExamPage() {
                     onChange={(e) => setImportRunPipeline(e.target.checked)}
                     disabled={uiLocked}
                   />
-                  Po imporcie uruchom pipeline (transkrypcja → analiza → raport)
+                  Po imporcie uruchom pipeline v2 (transkrypcja → facts → impression → analiza → raport)
                 </label>
 
                 <div className="flex items-center gap-2">
@@ -1262,7 +1290,7 @@ export default function ExamPage() {
                     disabled={uiLocked || !exam?.transcript}
                     title={!exam?.transcript ? "Brak transkrypcji" : ""}
                   >
-                    Analizuj
+                    Analizuj (v2)
                   </button>
 
                   {typeof qualityScore === "number" && (
@@ -1325,9 +1353,9 @@ export default function ExamPage() {
                   className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
                   onClick={generateReportNow}
                   disabled={uiLocked}
-                  title="Generuj raport na nowo i nadpisz draft"
+                  title="Generuj raport v2 na nowo i nadpisz draft"
                 >
-                  {generatingReport ? "Generuję…" : "Odśwież"}
+                  {generatingReport ? "Generuję…" : "Odśwież (v2)"}
                 </button>
               </div>
             </div>

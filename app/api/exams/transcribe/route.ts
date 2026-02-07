@@ -1,4 +1,3 @@
-// app/api/exams/transcribe/route.ts
 export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
@@ -21,6 +20,11 @@ function getRequiredEnv(name: string): string {
 }
 
 function safeInt(v: string | undefined, def: number) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+
+function safeFloat(v: string | undefined, def: number) {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
 }
@@ -76,6 +80,59 @@ function postprocessTranscript(raw: string) {
     .join("\n");
 
   return cleaned.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/** Medyczna autokorekta STT (deterministyczna, bez LLM). */
+type Replace = string | ((match: string, ...args: any[]) => string);
+
+function medicalCorrections(input: string) {
+  let s = (input || "").toString();
+
+  const rules: Array<[RegExp, Replace]> = [
+    // echogeniczność
+    [/\behebryczno(?:ść|s[cć])\b/giu, "echogeniczność"],
+    [/\bechogoniczno(?:ść|s[cć])\b/giu, "echogeniczność"],
+    [/\becho\s*gęsto(?:ść|s[cć])\b/giu, "echogeniczność"],
+
+    // miedniczka / nerka / śledziona
+    [/\bmilniczk[ai]\b/giu, "miedniczka"],
+    [/\bnierk[ai]\b/giu, (m: string) => (m.toLowerCase().endsWith("a") ? "nerka" : "nerki")],
+    [/\bśledzon[ay]\b/giu, "śledziona"],
+
+    // doppler
+    [/\bdople(?:ż|z)e\b/giu, "Doppler"],
+    [/\bdopler(?:em|ze|a|u|y)?\b/giu, "Doppler"],
+
+    // cień akustyczny
+    [/\bcieniak(?:\s+użytkow(?:y|a|e))?\b/giu, "cień akustyczny"],
+
+    // jajniki / krezkowe
+    [/\bwiejnik(?:i|ów|ach|ami)?\b/giu, "jajniki"],
+    [/\bkreskow(?:e|ych|ymi|ego|a)\b/giu, "krezkowe"],
+
+    // pęcherz moczowy
+    [/\bpęcharz\b/giu, "pęcherz"],
+    [/\bpęcherz\s+mocow(?:y|a|e)\b/giu, "pęcherz moczowy"],
+
+    // ropomacicze / piometra
+    [/\bpiometr(?:a|y|ze|ą)?\b/giu, "piometra"],
+    [/\bpyometra\b/giu, "piometra"],
+
+    // angio-TK
+    [/\bangioteka\b/giu, "angio-TK"],
+    [/\bangio\s*teka\b/giu, "angio-TK"],
+
+    // drobne korekty
+    [/\bzróżnicowanie\s+korowo\s*[- ]\s*rdzeniow(?:e|a|y)\b/giu, "zróżnicowanie korowo-rdzeniowe"],
+    [/\bniepogrubia(?:łe|ła|ły)\b/giu, "niepogrubiałe"],
+    [/\bwywiatował\b/giu, "wymiotował"],
+  ];
+
+  for (const [rx, repl] of rules) {
+    s = s.replace(rx, repl as any);
+  }
+
+  return s.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 /* ===================== Transcript quality scoring ===================== */
@@ -241,6 +298,123 @@ async function getAdminDb() {
   return getFirestore();
 }
 
+/* ================== stt runner ================== */
+
+type SttRunResult = {
+  ok: boolean;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  transcriptRaw: string;
+  transcript: string;
+  quality: TranscriptQuality;
+
+  // DEBUG
+  tmpDir: string;
+  filesPreview: string[];
+  argsPreview: string[];
+};
+
+async function runMlxWhisper(opts: {
+  audioAbsPath: string;
+  tmpRootId: string;
+  model: string;
+  lang: string;
+  timeoutMs: number;
+  bestOf: number;
+  temperature: number;
+  initialPrompt?: string;
+  bin: string;
+
+  conditionOnPreviousText: boolean;
+  compressionRatioThreshold: number;
+  noSpeechThreshold: number;
+}): Promise<SttRunResult> {
+  const tmpDir = path.join(os.tmpdir(), `vetvoice-stt-${opts.tmpRootId}-${Date.now()}`);
+  await fs.mkdir(tmpDir, { recursive: true });
+
+  const args: string[] = [
+    opts.audioAbsPath,
+    "--task", "transcribe",
+    "--model", opts.model,
+    "--language", opts.lang,
+    "--output-format", "txt",
+    "--output-dir", tmpDir,
+    "--temperature", String(opts.temperature),
+    "--best-of", String(opts.bestOf),
+
+    // anty-loop / cisza
+    "--condition-on-previous-text", opts.conditionOnPreviousText ? "True" : "False",
+    "--compression-ratio-threshold", String(opts.compressionRatioThreshold),
+    "--no-speech-threshold", String(opts.noSpeechThreshold),
+  ];
+
+  if (opts.initialPrompt && opts.initialPrompt.trim().length > 0) {
+    args.push("--initial-prompt", opts.initialPrompt.trim());
+  }
+
+  let stdout = "";
+  let stderr = "";
+
+  const child = spawn(opts.bin, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      HF_HUB_OFFLINE: "1",
+      TRANSFORMERS_OFFLINE: "1",
+      HF_DATASETS_OFFLINE: "1",
+    },
+  });
+
+  child.stdout?.on("data", (d) => (stdout += d.toString()));
+  child.stderr?.on("data", (d) => (stderr += d.toString()));
+
+  const exit = await Promise.race([
+    new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((res) =>
+      child.on("close", (code, signal) => res({ code, signal }))
+    ),
+    new Promise<{ code: null; signal: "SIGKILL" }>((res) =>
+      setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch {}
+        res({ code: null, signal: "SIGKILL" });
+      }, opts.timeoutMs)
+    ),
+  ]);
+
+  const files = await fs.readdir(tmpDir).catch(() => []);
+  const filesPreview = files.slice(0, 50);
+  const txt = files.find((f) => f.endsWith(".txt"));
+
+  let transcriptRaw = "";
+  let transcript = "";
+
+  if (txt) {
+    transcriptRaw = (await fs.readFile(path.join(tmpDir, txt), "utf8")).toString().trim();
+    transcript = postprocessTranscript(transcriptRaw);
+    transcript = medicalCorrections(transcript);
+  }
+
+  const quality = computeTranscriptQuality(transcript, transcriptRaw);
+
+  // sprzątanie (best effort) — UWAGA: usuwamy po readdir
+  fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+
+  return {
+    ok: !!txt && exit.signal !== "SIGKILL" && (exit.code === 0 || exit.code === null),
+    exitCode: exit.code,
+    signal: exit.signal,
+    stdout,
+    stderr,
+    transcriptRaw,
+    transcript,
+    quality,
+    tmpDir,
+    filesPreview,
+    argsPreview: args,
+  };
+}
+
 /* ================== route ================== */
 
 export async function POST(req: NextRequest) {
@@ -307,69 +481,86 @@ export async function POST(req: NextRequest) {
 
     const MLX = getRequiredEnv("MLX_WHISPER_BIN");
     const MODEL = getRequiredEnv("WHISPER_MODEL");
-    const LANG = (process.env.WHISPER_LANGUAGE || "pl").toString();
+
+    // normalizacja: usuń końcowe kropki/spacje w języku (np. "pl.")
+    const langRaw = (process.env.WHISPER_LANGUAGE || "pl").toString().trim().replace(/\.+$/g, "");
+    const LANG = langRaw.length ? langRaw : "pl";
+
     const TIMEOUT_MS = safeInt(process.env.TRANSCRIBE_TIMEOUT_MS, 480_000);
-    const BEST_OF = safeInt(process.env.TRANSCRIBE_BEST_OF, 3);
+
+    const BEST_OF_FAST = safeInt(process.env.TRANSCRIBE_BEST_OF, 1);
+    const BEST_OF_RETRY = safeInt(process.env.TRANSCRIBE_BEST_OF_RETRY, 3);
+
     const TEMPERATURE = 0;
+    const INITIAL_PROMPT = (process.env.WHISPER_INITIAL_PROMPT || "").toString().trim();
 
-    const tmpDir = path.join(os.tmpdir(), `vetvoice-stt-${examId}-${runId}`);
-    await fs.mkdir(tmpDir, { recursive: true });
+    // anty-loop / cisza
+    const CONDITION_ON_PREV = (process.env.WHISPER_CONDITION_ON_PREVIOUS_TEXT || "false").toLowerCase() === "true";
+    const COMP_RATIO = safeFloat(process.env.WHISPER_COMPRESSION_RATIO_THRESHOLD, 2.2);
+    const NO_SPEECH = safeFloat(process.env.WHISPER_NO_SPEECH_THRESHOLD, 0.55);
 
-    const args = [
+    function boolTF(v: boolean) {
+      return v ? "True" : "False";
+}
+
+
+    // Run 1
+    const r1 = await runMlxWhisper({
       audioAbsPath,
-      "--task","transcribe",
-      "--model", MODEL,
-      "--language", LANG,
-      "--output-format","txt",
-      "--output-dir", tmpDir,
-      "--temperature", String(TEMPERATURE),
-      "--best-of", String(BEST_OF),
-    ];
-
-    let stdout = "";
-    let stderr = "";
-
-    const child = spawn(MLX, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        HF_HUB_OFFLINE: "1",
-        TRANSFORMERS_OFFLINE: "1",
-        HF_DATASETS_OFFLINE: "1",
-      },
+      tmpRootId: `${examId}-${runId}-r1`,
+      model: MODEL,
+      lang: LANG,
+      timeoutMs: TIMEOUT_MS,
+      bestOf: BEST_OF_FAST,
+      temperature: TEMPERATURE,
+      initialPrompt: INITIAL_PROMPT,
+      bin: MLX,
+      conditionOnPreviousText: CONDITION_ON_PREV,
+      compressionRatioThreshold: COMP_RATIO,
+      noSpeechThreshold: NO_SPEECH,
     });
 
-    child.stdout?.on("data", (d) => (stdout += d.toString()));
-    child.stderr?.on("data", (d) => (stderr += d.toString()));
+    let finalRun = r1;
 
-    const exit = await Promise.race([
-      new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((res) =>
-        child.on("close", (code, signal) => res({ code, signal }))
-      ),
-      new Promise<{ code: null; signal: "SIGKILL" }>((res) =>
-        setTimeout(() => {
-          try { child.kill("SIGKILL"); } catch {}
-          res({ code: null, signal: "SIGKILL" });
-        }, TIMEOUT_MS)
-      ),
-    ]);
+    const shouldRetry =
+      (r1.transcript.trim().length === 0 || r1.quality.score < 65 || r1.quality.flags.includes("QUALITY_LOW")) &&
+      BEST_OF_RETRY > BEST_OF_FAST;
+
+    if (shouldRetry) {
+      const r2 = await runMlxWhisper({
+        audioAbsPath,
+        tmpRootId: `${examId}-${runId}-r2`,
+        model: MODEL,
+        lang: LANG,
+        timeoutMs: TIMEOUT_MS,
+        bestOf: BEST_OF_RETRY,
+        temperature: TEMPERATURE,
+        initialPrompt: INITIAL_PROMPT,
+        bin: MLX,
+        conditionOnPreviousText: CONDITION_ON_PREV,
+        compressionRatioThreshold: COMP_RATIO,
+        noSpeechThreshold: NO_SPEECH,
+      });
+
+      finalRun = r2.quality.score >= r1.quality.score ? r2 : r1;
+    }
 
     const finishedAt = nowIso();
     const durationMs = new Date(finishedAt).getTime() - new Date(startedAt).getTime();
 
-    const files = await fs.readdir(tmpDir).catch(() => []);
-    const txt = files.find((f) => f.endsWith(".txt"));
-
-    if (!txt) {
+    if (!finalRun.transcriptRaw || finalRun.transcript.trim().length === 0) {
       // zapisz run info jako błąd
       await examRef.update({
         transcriptError: {
           at: nowIso(),
           message: "No transcript produced",
-          exitCode: exit.code,
-          signal: exit.signal,
-          stderrPreview: preview(stderr, 1600),
-          stdoutPreview: preview(stdout, 800),
+          exitCode: finalRun.exitCode,
+          signal: finalRun.signal,
+          stderrPreview: preview(finalRun.stderr, 3000),
+          stdoutPreview: preview(finalRun.stdout, 1600),
+          filesPreview: finalRun.filesPreview,
+          tmpDir: finalRun.tmpDir,
+          argsPreview: finalRun.argsPreview.slice(0, 60),
         },
         transcriptMeta: {
           lastRunId: runId,
@@ -377,7 +568,12 @@ export async function POST(req: NextRequest) {
           model: MODEL,
           language: LANG,
           temperature: TEMPERATURE,
-          bestOf: BEST_OF,
+          bestOf: BEST_OF_FAST,
+          bestOfRetry: BEST_OF_RETRY,
+          initialPromptUsed: INITIAL_PROMPT ? true : false,
+          conditionOnPreviousText: CONDITION_ON_PREV,
+          compressionRatioThreshold: COMP_RATIO,
+          noSpeechThreshold: NO_SPEECH,
           offline: true,
           bin: MLX,
           audioChosenPath: chosenRelPath,
@@ -391,21 +587,21 @@ export async function POST(req: NextRequest) {
         {
           ok: false,
           error: "No transcript produced",
-          exitCode: exit.code,
-          signal: exit.signal,
-          stderr: preview(stderr, 1800),
-          stdout: preview(stdout, 900),
+          exitCode: finalRun.exitCode,
+          signal: finalRun.signal,
+          stderr: preview(finalRun.stderr, 3500),
+          stdout: preview(finalRun.stdout, 1800),
+          tmpDir: finalRun.tmpDir,
+          filesPreview: finalRun.filesPreview,
+          argsPreview: finalRun.argsPreview,
         },
         { status: 500 }
       );
     }
 
-    const transcriptRaw = (await fs.readFile(path.join(tmpDir, txt), "utf8")).toString().trim();
-    const transcript = postprocessTranscript(transcriptRaw);
-    const q = computeTranscriptQuality(transcript, transcriptRaw);
-
-    // sprzątanie (best effort)
-    fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    const transcriptRaw = finalRun.transcriptRaw;
+    const transcript = finalRun.transcript;
+    const q = finalRun.quality;
 
     const alertLevel =
       q.score < 55 ? "critical" :
@@ -424,7 +620,12 @@ export async function POST(req: NextRequest) {
         model: MODEL,
         language: LANG,
         temperature: TEMPERATURE,
-        bestOf: BEST_OF,
+        bestOf: BEST_OF_FAST,
+        bestOfRetry: BEST_OF_RETRY,
+        initialPromptUsed: INITIAL_PROMPT ? true : false,
+        conditionOnPreviousText: CONDITION_ON_PREV,
+        compressionRatioThreshold: COMP_RATIO,
+        noSpeechThreshold: NO_SPEECH,
         offline: true,
         bin: MLX,
         audioChosenPath: chosenRelPath,
@@ -434,7 +635,6 @@ export async function POST(req: NextRequest) {
         alertLevel,
         durationMs,
       },
-      // historia uruchomień — prosto i bez ryzyka nadpisania
       transcriptRuns: FieldValue.arrayUnion({
         runId,
         at: startedAt,
@@ -446,12 +646,17 @@ export async function POST(req: NextRequest) {
         model: MODEL,
         language: LANG,
         temperature: TEMPERATURE,
-        bestOf: BEST_OF,
+        bestOf: BEST_OF_FAST,
+        bestOfRetry: BEST_OF_RETRY,
+        initialPromptUsed: INITIAL_PROMPT ? true : false,
+        conditionOnPreviousText: CONDITION_ON_PREV,
+        compressionRatioThreshold: COMP_RATIO,
+        noSpeechThreshold: NO_SPEECH,
         offline: true,
-        exitCode: exit.code,
-        signal: exit.signal,
-        stderrPreview: preview(stderr, 900),
-        stdoutPreview: preview(stdout, 600),
+        exitCode: finalRun.exitCode,
+        signal: finalRun.signal,
+        stderrPreview: preview(finalRun.stderr, 900),
+        stdoutPreview: preview(finalRun.stdout, 600),
         score: q.score,
         flags: q.flags,
         metrics: q.metrics,
@@ -477,7 +682,8 @@ export async function POST(req: NextRequest) {
         language: LANG,
         durationMs,
         offline: true,
-        stderrPreview: preview(stderr, 600),
+        initialPromptUsed: INITIAL_PROMPT ? true : false,
+        stderrPreview: preview(finalRun.stderr, 600),
       },
     });
   } catch (e: any) {

@@ -8,7 +8,7 @@ import fs from "fs/promises";
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 
-const PROMPT_VERSION = "analyze-v6-structured-clean";
+const PROMPT_VERSION = "analyze-v4";
 
 // ---- LM Studio config ----
 function getLmConfig() {
@@ -30,44 +30,10 @@ async function getAdminDb() {
   return getFirestore(app);
 }
 
-// ---- Text cleaning (deterministyczne) ----
-function cleanMedicalPolish(input: string) {
-  let s = input;
-
-  // częste błędy STT / odmiany
-  s = s.replace(/\bnetki\b/gi, "nerki");
-  s = s.replace(/\bbrusznej\b/gi, "brzusznej");
-  s = s.replace(/\bbruszna\b/gi, "brzuszna");
-  s = s.replace(/\bbruszny\b/gi, "brzuszny");
-  s = s.replace(/\bbrusznego\b/gi, "brzusznego");
-
-  // "przeroźniona" itp.
-  s = s.replace(/\bprzeroźnion([aąeęyio])\b/gi, "przerośnięt$1");
-  s = s.replace(/\bprzeroźnięt([aąeęyio])\b/gi, "przerośnięt$1");
-  s = s.replace(/\bprzeroźnięta\b/gi, "przerośnięta");
-  s = s.replace(/\bprzeroźnięty\b/gi, "przerośnięty");
-  s = s.replace(/\bprzeroźnięte\b/gi, "przerośnięte");
-
-  // "kęste osad" -> "gęsty osad" (różne końcówki)
-  s = s.replace(/\bkęst([eyąa])\b/gi, "gęst$1");
-
-  // opcjonalnie: cysta/cysty -> torbiel/torbiele (jeśli wolisz)
-  // UWAGA: jeśli wolisz zostawić "cysta", zakomentuj blok poniżej
-  s = s.replace(/\bcystami\b/gi, "torbielami");
-  s = s.replace(/\bcystach\b/gi, "torbielach");
-  s = s.replace(/\bcysty\b/gi, "torbiele");
-  s = s.replace(/\bcysta\b/gi, "torbiel");
-  s = s.replace(/\bcyste\b/gi, "torbiele");
-
-  // whitespace
-  s = s.replace(/\s+/g, " ").trim();
-  return s;
-}
-
 // ---- Prompt ----
 function buildSystemPrompt(examType: string) {
   return `
-Jesteś asystentem lekarza weterynarii. Masz WYŁĄCZNIE wyekstrahować informacje medyczne z transkrypcji i przypisać je do pól.
+Jesteś asystentem lekarza weterynarii. Masz WYŁĄCZNIE wyekstrahować informacje medyczne z transkrypcji i przypisać je do pól raportu.
 
 WYMÓG FORMATU:
 - Zwróć WYŁĄCZNIE poprawny JSON.
@@ -76,18 +42,12 @@ WYMÓG FORMATU:
 - Jeśli brak informacji -> null.
 - Nie wymyślaj faktów.
 - Ignoruj komendy/uspokajanie/organizacyjne ("spokojnie", "nie ruszaj się", "moment", itp.).
-- Jeśli w transkrypcji jest oczywista literówka (np. "netki" -> "nerki", "brusznej" -> "brzusznej", "kęste" -> "gęste", "przeroźnięta" -> "przerośnięta"), popraw ją w polach wynikowych.
 
-Sekcje (krótko, klinicznie):
+Sekcje:
 - reason: powód wizyty (1–2 zdania)
-- findings: opis badania: zapisuj narządami w formacie "Wątroba: ... Śledziona: ... Nerki: ... Pęcherz: ... Prostata: ..." jeśli te narządy są w transkrypcji.
-- conclusions: wnioski/podsumowanie (1–3 zdania, bez spekulacji; nie używaj "chyba/może", chyba że pada w transkrypcji)
-- recommendations: zalecenia (TYLKO jeśli w transkrypcji padają konkretne działania)
-
-Dodatkowo:
-- entities: kluczowe encje (pacjent, narządy, problemy)
-- keyFindings: 3–8 najważniejszych ustaleń (krótkie punkty, bez numeracji)
-- evidence: do 6 krótkich cytatów (claim + quote) wspierających kluczowe ustalenia; quote to krótki fragment transkrypcji (1 linia)
+- findings: opis badania (co oceniono i co stwierdzono)
+- conclusions: wnioski/podsumowanie
+- recommendations: zalecenia (tylko jeśli padają konkretne)
 
 Typ badania: ${examType}
 
@@ -98,14 +58,7 @@ Oczekiwany JSON (dokładnie te klucze):
     "findings": string | null,
     "conclusions": string | null,
     "recommendations": string | null
-  },
-  "entities": {
-    "patientName": string | null,
-    "organsMentioned": string[] | null,
-    "problemsMentioned": string[] | null
-  },
-  "keyFindings": string[] | null,
-  "evidence": { "claim": string, "quote": string }[] | null
+  }
 }
 `.trim();
 }
@@ -154,6 +107,7 @@ function escapeNewlinesInsideJsonStrings(input: string) {
       continue;
     }
 
+    // kluczowe: gołe newline w stringu = invalid JSON
     if (ch === "\n") {
       out += "\\n";
       continue;
@@ -174,42 +128,18 @@ function safeJsonParse(text: string) {
   try {
     return JSON.parse(slice);
   } catch {
+    // ratunek #1: zamień newline wewnątrz stringów na \n
     const repaired = escapeNewlinesInsideJsonStrings(slice);
     return JSON.parse(repaired);
   }
 }
 
 function oneLine(s: string) {
-  return s.replace(/\r?\n|\r/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function normString(v: any): string | null {
-  if (typeof v !== "string") return null;
-  return cleanMedicalPolish(oneLine(v));
-}
-
-function normArray(arr: any): string[] | null {
-  if (!Array.isArray(arr)) return null;
-  const cleaned = arr
-    .filter((x) => typeof x === "string")
-    .map((x) => cleanMedicalPolish(oneLine(x)))
-    .filter(Boolean);
-
-  const uniq = Array.from(new Set(cleaned));
-  return uniq.length ? uniq : null;
-}
-
-function normEvidence(arr: any): { claim: string; quote: string }[] | null {
-  if (!Array.isArray(arr)) return null;
-  const cleaned = arr
-    .map((x) => ({
-      claim: typeof x?.claim === "string" ? cleanMedicalPolish(oneLine(x.claim)) : null,
-      quote: typeof x?.quote === "string" ? cleanMedicalPolish(oneLine(x.quote)) : null,
-    }))
-    .filter((x) => !!x.claim && !!x.quote)
-    .slice(0, 6) as { claim: string; quote: string }[];
-
-  return cleaned.length ? cleaned : null;
+  // “jedna linia” + kompresja whitespace
+  return s
+    .replace(/\r?\n|\r/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 // ---- LM calls ----
@@ -222,7 +152,7 @@ async function callLmChat(args: {
   temperature?: number;
   useJsonResponseFormat?: boolean;
 }) {
-  const { baseUrl, model, system, user, maxTokens = 900, temperature = 0, useJsonResponseFormat = true } = args;
+  const { baseUrl, model, system, user, maxTokens = 500, temperature = 0, useJsonResponseFormat = true } = args;
 
   const body: any = {
     model,
@@ -235,6 +165,7 @@ async function callLmChat(args: {
     ],
   };
 
+  // OpenAI-compatible: response_format
   if (useJsonResponseFormat) {
     body.response_format = { type: "json_object" };
   }
@@ -271,12 +202,13 @@ Nie zmieniaj znaczenia — tylko napraw format (cudzysłowy, przecinki, ucieczki
 
   const user = `NAPRAW TEN JSON I ZWRÓĆ POPRAWNY JSON:\n${broken}`;
 
+  // bez response_format — bywa, że LM Studio się czepia
   const r = await callLmChat({
     baseUrl,
     model,
     system,
     user,
-    maxTokens: 1100,
+    maxTokens: 700,
     temperature: 0,
     useJsonResponseFormat: false,
   });
@@ -291,7 +223,7 @@ export async function POST(req: NextRequest) {
 
   try {
     const { clinicId, patientId, examId } = (await req.json()) as {
-      clinicId?: string;
+      clinicId?: string; // opcjonalne
       patientId?: string;
       examId?: string;
     };
@@ -302,7 +234,7 @@ export async function POST(req: NextRequest) {
 
     const adminDb = await getAdminDb();
 
-    // dual-path lookup
+    // dual-path lookup (jak generate-report)
     const refA = adminDb.doc(`patients/${patientId}/exams/${examId}`);
     const refB = clinicId ? adminDb.doc(`clinics/${clinicId}/patients/${patientId}/exams/${examId}`) : null;
 
@@ -315,7 +247,10 @@ export async function POST(req: NextRequest) {
 
     if (!snap.exists) {
       return NextResponse.json(
-        { error: "Exam not found", tried: { pathA: refA.path, pathB: refB?.path ?? null } },
+        {
+          error: "Exam not found",
+          tried: { pathA: refA.path, pathB: refB?.path ?? null },
+        },
         { status: 404 }
       );
     }
@@ -325,13 +260,18 @@ export async function POST(req: NextRequest) {
     const examType: string = (exam?.type || "Badanie").toString();
 
     if (!transcript || !transcript.trim()) {
-      return NextResponse.json({ error: "No transcript in exam (analyze requires transcript)" }, { status: 400 });
+      return NextResponse.json(
+        { error: "No transcript in exam (analyze requires transcript)" },
+        { status: 400 }
+      );
     }
 
     const { baseUrl, model } = getLmConfig();
     const system = buildSystemPrompt(examType);
 
-    const user = `TRANSKRYPCJA:\n${transcript.trim()}`;
+    // (opcjonalnie) utnij skrajnie długie transkrypcje, żeby nie rozwalić kontekstu
+    const transcriptTrimmed = transcript.trim();
+    const user = `TRANSKRYPCJA:\n${transcriptTrimmed}`;
 
     // 1) call #1: z response_format
     let lm = await callLmChat({
@@ -339,7 +279,7 @@ export async function POST(req: NextRequest) {
       model,
       system,
       user,
-      maxTokens: 1100,
+      maxTokens: 600,
       temperature: 0,
       useJsonResponseFormat: true,
     });
@@ -351,7 +291,7 @@ export async function POST(req: NextRequest) {
         model,
         system,
         user,
-        maxTokens: 1100,
+        maxTokens: 600,
         temperature: 0,
         useJsonResponseFormat: false,
       });
@@ -396,24 +336,13 @@ export async function POST(req: NextRequest) {
     }
 
     const sections = parsed?.sections ?? {};
-    const entities = parsed?.entities ?? {};
-    const keyFindings = parsed?.keyFindings ?? null;
-    const evidence = parsed?.evidence ?? null;
-
     const normalized = {
       sections: {
-        reason: normString(sections.reason),
-        findings: normString(sections.findings),
-        conclusions: normString(sections.conclusions),
-        recommendations: normString(sections.recommendations),
+        reason: typeof sections.reason === "string" ? oneLine(sections.reason) : null,
+        findings: typeof sections.findings === "string" ? oneLine(sections.findings) : null,
+        conclusions: typeof sections.conclusions === "string" ? oneLine(sections.conclusions) : null,
+        recommendations: typeof sections.recommendations === "string" ? oneLine(sections.recommendations) : null,
       },
-      entities: {
-        patientName: normString(entities.patientName),
-        organsMentioned: normArray(entities.organsMentioned),
-        problemsMentioned: normArray(entities.problemsMentioned),
-      },
-      keyFindings: normArray(keyFindings),
-      evidence: normEvidence(evidence),
     };
 
     const missing = {
@@ -421,8 +350,6 @@ export async function POST(req: NextRequest) {
       findings: !normalized.sections.findings,
       conclusions: !normalized.sections.conclusions,
       recommendations: !normalized.sections.recommendations,
-      keyFindings: !(normalized.keyFindings && normalized.keyFindings.length),
-      evidence: !(normalized.evidence && normalized.evidence.length),
     };
 
     const latencyMs = Date.now() - started;
@@ -437,6 +364,7 @@ export async function POST(req: NextRequest) {
         promptVersion: PROMPT_VERSION,
         latencyMs,
         analyzedAt: new Date(),
+        // pomocne w debug: czy było naprawiane
         jsonRepaired: finalText !== content,
       },
     });

@@ -6,364 +6,349 @@ import path from "path";
 import fs from "fs/promises";
 
 import { cert, getApps, initializeApp } from "firebase-admin/app";
-import { getFirestore } from "firebase-admin/firestore";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
 
 const REPORT_VERSION =
-  "analysis-template-v2-p09-aggregate-findings-by-organ+anti-loop+wnioski-fallback+no-transcript";
-const DATE_LOCALE = "pl-PL";
+  "analysis-template-v2-p13-hard-post-normalize+conditions-guard+optional-polish";
 
-/* ================= Firebase ================= */
-
+/* =========================
+   Firebase (NO dynamic require)
+========================= */
 async function getAdminDb() {
-  const relPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
-  if (!relPath) throw new Error("Missing FIREBASE_SERVICE_ACCOUNT_PATH");
+  if (!getApps().length) {
+    const relPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+    if (!relPath) throw new Error("Missing env FIREBASE_SERVICE_ACCOUNT_PATH");
 
-  const absPath = path.join(process.cwd(), relPath);
-  const raw = await fs.readFile(absPath, "utf-8");
-  const serviceAccount = JSON.parse(raw);
+    const absPath = path.resolve(process.cwd(), relPath);
+    const raw = await fs.readFile(absPath, "utf-8");
+    const serviceAccount = JSON.parse(raw);
 
-  const app =
-    getApps().length > 0
-      ? getApps()[0]
-      : initializeApp({ credential: cert(serviceAccount) });
-
-  return getFirestore(app);
-}
-
-/* ================= Helpers ================= */
-
-function formatDatePL(d = new Date()) {
-  return new Intl.DateTimeFormat(DATE_LOCALE, {
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(d);
-}
-
-function cleanLine(s: string) {
-  return String(s ?? "").replace(/\s+/g, " ").trim();
-}
-
-function normKey(s: string) {
-  return cleanLine(s)
-    .toLowerCase()
-    .replace(/[.。]\s*$/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-/**
- * Anti-loop na poziomie raportu:
- * - jeśli linia powtarza się > maxRepeats, zostawia keep (domyślnie 1)
- * - dodatkowo robi finalne uniq (case-insensitive)
- */
-function limitRepeatedLines(lines: string[], opts?: { maxRepeats?: number; keep?: number }) {
-  const maxRepeats = opts?.maxRepeats ?? 2;
-  const keep = opts?.keep ?? 1;
-
-  const counts = new Map<string, number>();
-  const kept = new Map<string, number>();
-  const out: string[] = [];
-
-  for (const raw of lines) {
-    const line = cleanLine(raw);
-    if (!line) continue;
-
-    const key = normKey(line);
-    const c = (counts.get(key) ?? 0) + 1;
-    counts.set(key, c);
-
-    if (c > maxRepeats) {
-      const k = kept.get(key) ?? 0;
-      if (k < keep) {
-        out.push(line);
-        kept.set(key, k + 1);
-      }
-      continue;
-    }
-
-    out.push(line);
+    initializeApp({ credential: cert(serviceAccount) });
   }
-
-  const seen = new Set<string>();
-  const uniq: string[] = [];
-  for (const l of out) {
-    const k = normKey(l);
-    if (seen.has(k)) continue;
-    seen.add(k);
-    uniq.push(l);
-  }
-  return uniq;
+  return getFirestore();
 }
 
-function isNoiseFinding(line: string) {
-  const s = cleanLine(line);
-  if (!s) return true;
+/* =========================
+   HARD FILTERS / NORMALIZATION
+========================= */
 
-  // same nagłówki typu "Śledziona." / "Jelito." / "Nerki."
-  if (/^[A-ZĄĆĘŁŃÓŚŻŹ][a-ząćęłńóśżź]+[.!?]?$/.test(s)) return true;
+// TYLKO techniczne warunki badania (bez wniosków typu "śledziona reaktywna")
+const ALLOWED_CONDITIONS = [
+  "bez sedacji",
+  "z sedacją",
+  "pozycja",
+  "position",
+  "na plecach",
+  "na boku",
+  "na boczku",
+  "pozycja grzbietowa",
+  "pozycja boczna",
+  "pacjent niespokojny",
+  "niespokojny",
+  "utrudnione badanie",
+  "utrudniony",
+  "ograniczona widoczność",
+  "słaba widoczność",
+  "duży pacjent",
+  "pacjent duży",
+  "trudne badanie",
+  "bez narkozy",
+  "znieczulenie",
+];
 
-  // zbyt krótkie, bez treści
-  const wc = s.split(" ").filter(Boolean).length;
-  if (wc <= 2) return true;
-
-  // ogólniaki
-  const low = s.toLowerCase();
-  if (low.includes("wydaje się, że nie ma żadnego problemu")) return true;
-
-  return false;
+function filterExamConditions(lines: string[] = []) {
+  return lines
+    .map((l) => (typeof l === "string" ? l.trim() : ""))
+    .filter(Boolean)
+    .filter((l) => ALLOWED_CONDITIONS.some((k) => l.toLowerCase().includes(k)));
 }
 
-/**
- * Agreguje OPIS BADANIA po narządzie:
- * - wejście: ["Wątroba: ...", "Wątroba: ...", "Śledziona: ..."]
- * - wyjście: ["Wątroba: ...; ...; ...", "Śledziona: ..."]
- *
- * Zachowuje kolejność narządów wg pierwszego wystąpienia.
- */
-function aggregateFindingsByOrgan(findings: string[]) {
-  const groups = new Map<string, string[]>();
-  const passthrough: string[] = [];
+// Ostatnia linia obrony – korekta STT i stylu (bez interpretacji klinicznej)
+function finalMedicalNormalize(s: string) {
+  return s
+    // literówki / STT
+    .replace(/\behebryczność\b/gi, "echogeniczność")
+    .replace(/\bechogoniczność\b/gi, "echogeniczność")
+    .replace(/\bechogenicznoś[ćc]\b/gi, "echogeniczność")
+    .replace(/\bjedniczka\b/gi, "miedniczka")
+    .replace(/\bamy brzusznej\b/gi, "jamy brzusznej")
+    .replace(/\bdo plerem\b/gi, "dopplerem")
+    .replace(/\bWęzy\b/gi, "Węzły")
+    .replace(/\bkrężkowe\b/gi, "krezkowe")
 
-  for (const raw of findings) {
-    const line = cleanLine(raw);
-    if (!line) continue;
-    if (isNoiseFinding(line)) continue;
-
-    const idx = line.indexOf(":");
-    if (idx === -1) {
-      passthrough.push(line);
-      continue;
-    }
-
-    const organ = cleanLine(line.slice(0, idx));
-    const desc = cleanLine(line.slice(idx + 1));
-    if (!organ || !desc) continue;
-
-    const arr = groups.get(organ) ?? [];
-    arr.push(desc);
-    groups.set(organ, arr);
-  }
-
-  const order: string[] = [];
-  for (const raw of findings) {
-    const idx = String(raw).indexOf(":");
-    if (idx === -1) continue;
-    const organ = cleanLine(String(raw).slice(0, idx));
-    if (!organ) continue;
-    if (!order.includes(organ)) order.push(organ);
-  }
-
-  const out: string[] = [];
-  for (const organ of order) {
-    const descs = groups.get(organ) ?? [];
-    if (!descs.length) continue;
-
-    const merged = limitRepeatedLines(descs, { maxRepeats: 1, keep: 1 }).join("; ");
-    out.push(`${organ}: ${merged}`);
-  }
-
-  const tail = limitRepeatedLines(passthrough, { maxRepeats: 1, keep: 1 });
-  for (const t of tail) out.push(t);
-
-  return out;
+    // lekkie ujednolicenie stylu (bez dodawania faktów)
+    .replace(/\bZalecam obserwacje\b/gi, "Zaleca się obserwację")
+    .replace(/\bzalecam obserwacje\b/gi, "zaleca się obserwację")
+    .replace(/\bpodobnie\b/gi, "o podobnym obrazie")
+    .replace(/\bnie widzę osadu ani kamieni\b/gi, "bez osadu ani kamieni");
 }
 
-/* ================= POWÓD BADANIA ================= */
-
-function resolveExamReason({ facts, analysis }: { facts?: any; analysis?: any }): string {
-  const candidates = [facts?.exam?.reason, facts?.reason, analysis?.sections?.reason];
-
-  for (const c of candidates) {
-    if (typeof c === "string") {
-      const s = c.trim();
-      if (s && s.toLowerCase() !== "nie podano") return s;
-    }
-  }
-
-  return "Nie podano w transkrypcji.";
+function normalizeLines(lines: string[] = []) {
+  return lines
+    .map((l) => (typeof l === "string" ? finalMedicalNormalize(l.trim()) : ""))
+    .filter(Boolean);
 }
 
-/* ================= WNIOSKI fallback ================= */
-
-function resolveConclusions({ facts, impression }: { facts?: any; impression?: any }) {
-  const fromImpression: string[] = Array.isArray(impression?.doctorKeyConcerns)
-    ? impression.doctorKeyConcerns
-    : [];
-
-  if (fromImpression.length) return fromImpression;
-
-  const findings: string[] = Array.isArray(facts?.findings) ? facts.findings : [];
-
-  const candidates = findings.filter((l) => {
-    const k = l.toLowerCase();
-    return (
-      k.startsWith("podsumowanie") ||
-      k.includes("podsumowanie badania") ||
-      k.includes("obraz usg wskazuje") ||
-      k.includes("przemawia za") ||
-      k.includes("sugeruje") ||
-      k.includes("najpewniej") ||
-      k.includes("cechy przewlekłego") ||
-      k.includes("krążenia wrotno") ||
-      k.includes("nadciśnienia wrotnego") ||
-      k.includes("przekrwieniem biernym")
-    );
-  });
-
-  return limitRepeatedLines(candidates, { maxRepeats: 1, keep: 1 });
+function unique(arr: string[]) {
+  return Array.from(new Set(arr));
 }
 
-/* ================= Render helpers ================= */
-
-function renderListSection(title: string, items: string[]) {
-  const out: string[] = [];
-  out.push(`${title}:`);
-  if (!items.length) {
-    out.push("—");
-    out.push("");
-    return out;
-  }
-  for (const i of items) out.push(`- ${cleanLine(i)}`);
-  out.push("");
-  return out;
+function safeString(x: unknown) {
+  return typeof x === "string" ? x.trim() : "";
 }
 
-/* ================= Endpoint ================= */
+/* =========================
+   OPTIONAL: LLM "POLISH" on final report
+   - only fixes typos/terminology/style
+   - must keep the structure & not add new facts
+========================= */
+async function polishReportWithLLM(input: string) {
+  if (process.env.REPORT_POLISH_WITH_LLM !== "1") return input;
 
-export async function POST(req: NextRequest) {
+  const baseUrl = process.env.LMSTUDIO_BASE_URL || "http://127.0.0.1:11434";
+  const model =
+    process.env.LMSTUDIO_MODEL_ALT ||
+    process.env.LMSTUDIO_MODEL ||
+    "qwen2.5-14b-instruct-1m";
+
+  const maxTokens = Number(process.env.REPORT_POLISH_MAX_TOKENS || 350);
+  const timeoutMs = Number(process.env.REPORT_POLISH_TIMEOUT_MS || 25000);
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
-    const { patientId, examId, sanitize, useLLM } =
-      (await req.json()) as {
-        patientId?: string;
-        examId?: string;
-        sanitize?: boolean;
-        useLLM?: boolean;
-      };
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        temperature: 0.1,
+        max_tokens: maxTokens,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Jesteś korektorem raportów weterynaryjnych PL. " +
+              "Popraw WYŁĄCZNIE: literówki, przekręcone słowa, interpunkcję, odmianę, terminologię (np. ehebryczność/echogoniczność -> echogeniczność; jedniczka -> miedniczka). " +
+              "Możesz lekko ujednolicić styl bez zmiany sensu (np. 'zalecam' -> 'zaleca się', 'podobnie' -> 'o podobnym obrazie'). " +
+              "NIE dodawaj żadnych nowych informacji medycznych. NIE dopisuj narządów, pomiarów, rozpoznań, zaleceń. NIE usuwaj faktów. " +
+              "Zachowaj układ sekcji i listy. " +
+              "Zwróć TYLKO gotowy tekst raportu (plain text), bez komentarzy, bez JSON."
+          },
+          { role: "user", content: input }
+        ]
+      })
+    });
+
+    if (!res.ok) return input;
+
+    const json = await res.json();
+    const out = json?.choices?.[0]?.message?.content;
+
+    if (typeof out !== "string") return input;
+    const trimmed = out.trim();
+    if (trimmed.length < 50) return input;
+
+    // Bezpiecznik: zachowaj wymagane nagłówki
+    const mustHave = [
+      "POWÓD BADANIA:",
+      "WARUNKI BADANIA:",
+      "OPIS BADANIA:",
+      "POMIARY:",
+      "WNIOSKI:",
+      "ZALECENIA:",
+      "OBJAWY ALARMOWE:",
+      "Uwaga: Dokument został automatycznie wygenerowany"
+    ];
+    for (const h of mustHave) if (!trimmed.includes(h)) return input;
+
+    return trimmed;
+  } catch {
+    return input;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/* =========================
+   API
+========================= */
+export async function POST(req: NextRequest) {
+  const t0 = Date.now();
+
+  try {
+    const body = await req.json();
+    const patientId = body?.patientId;
+    const examId = body?.examId;
+    const sanitize = body?.sanitize ?? true;
 
     if (!patientId || !examId) {
-      return NextResponse.json({ error: "Missing patientId or examId" }, { status: 400 });
+      return NextResponse.json({ ok: false, error: "Missing patientId/examId" }, { status: 400 });
     }
 
-    const adminDb = await getAdminDb();
-    const ref = adminDb.doc(`patients/${patientId}/exams/${examId}`);
+    const db = await getAdminDb();
+    const ref = db.doc(`patients/${patientId}/exams/${examId}`);
     const snap = await ref.get();
 
-    if (!snap.exists) return NextResponse.json({ error: "Exam not found" }, { status: 404 });
-
-    const exam = snap.data() as any;
-
-    const facts = exam?.facts || {};
-    const analysis = exam?.analysis || {};
-    const impression = exam?.impression || {};
-
-    const lines: string[] = [];
-
-    /* ================= Header ================= */
-
-    lines.push(`RAPORT BADANIA: USG jamy brzusznej`);
-    lines.push(`Data wygenerowania: ${formatDatePL(new Date())}`);
-
-    const patientName = cleanLine(facts?.exam?.patientName || "");
-    if (patientName) lines.push(`Pacjent: ${patientName}`);
-    lines.push("");
-
-    /* ================= POWÓD BADANIA ================= */
-
-    const examReason = resolveExamReason({ facts, analysis });
-    lines.push("POWÓD BADANIA:");
-    lines.push(`- ${examReason}`);
-    lines.push("");
-
-    /* ================= WARUNKI BADANIA ================= */
-
-    const conditionsRaw: string[] = Array.isArray(facts?.conditions) ? facts.conditions : [];
-    const conditions = limitRepeatedLines(conditionsRaw, { maxRepeats: 2, keep: 1 });
-    lines.push(...renderListSection("WARUNKI BADANIA", conditions));
-
-    /* ================= OPIS BADANIA ================= */
-
-    const findingsRaw: string[] = Array.isArray(facts?.findings) ? facts.findings : [];
-    const findingsAgg = aggregateFindingsByOrgan(findingsRaw);
-    const findings = limitRepeatedLines(findingsAgg, { maxRepeats: 2, keep: 1 });
-    lines.push(...renderListSection("OPIS BADANIA", findings));
-
-    /* ================= POMIARY ================= */
-
-    const measurements: any[] = Array.isArray(facts?.measurements) ? facts.measurements : [];
-    const measurementLines: string[] = [];
-
-    for (const m of measurements) {
-      if (!m || !Array.isArray(m.value) || !m.value.length) continue;
-      if (!m.unit) continue;
-
-      const range =
-        m.value.length === 1 ? `${m.value[0]}` : `${m.value[0]}–${m.value[m.value.length - 1]}`;
-
-      const labelParts = [m.structure, m.location].filter(Boolean);
-      const label = labelParts.join(" – ");
-
-      measurementLines.push(`${label}: ${range} ${m.unit}`);
+    if (!snap.exists) {
+      return NextResponse.json({ ok: false, error: "Exam not found" }, { status: 404 });
     }
 
-    lines.push(
-      ...renderListSection(
-        "POMIARY",
-        limitRepeatedLines(measurementLines, { maxRepeats: 2, keep: 1 })
-      )
+    const data = snap.data() || {};
+    const facts = data.facts || {};
+    const exam = facts.exam || {};
+    const impression = data.impression || {};
+    const analysis = data.analysis || {};
+
+    // ===== POWÓD / PACJENT =====
+    const patientName = safeString(exam.patientName) || null;
+    const reason = safeString(exam.reason) || null;
+
+    // ===== WARUNKI BADANIA (TYLKO TECHNICZNE) =====
+    const rawConditions: string[] = Array.isArray(facts.conditionsLines)
+      ? facts.conditionsLines
+      : Array.isArray(facts.conditions)
+        ? facts.conditions
+        : [];
+
+    const conditions = normalizeLines(filterExamConditions(rawConditions));
+
+    // ===== OPIS BADANIA =====
+    const rawFindings: string[] = Array.isArray(facts.findingsLines)
+      ? facts.findingsLines
+      : Array.isArray(facts.findings)
+        ? facts.findings
+        : [];
+
+    const findings = normalizeLines(rawFindings);
+
+    // ===== POMIARY =====
+    const measFromFacts = Array.isArray(facts.measurements) ? facts.measurements : [];
+    const measurementsLines: string[] = [];
+
+    for (const m of measFromFacts as any[]) {
+      const structure = safeString(m?.structure);
+      const unit = safeString(m?.unit);
+      const value = Array.isArray(m?.value) ? m.value : [];
+      const nums = value.filter((x: any) => typeof x === "number" && Number.isFinite(x));
+      if (!structure || nums.length === 0) continue;
+
+      const valStr = nums.length === 2 ? `${nums[0]}–${nums[1]}` : `${nums[0]}`;
+      measurementsLines.push(`${structure}: ${valStr}${unit ? " " + unit : ""}`);
+    }
+
+    const measurementsSummary: string[] = measurementsLines.length
+      ? measurementsLines
+      : Array.isArray(analysis.measurementsSummary)
+        ? analysis.measurementsSummary
+        : [];
+
+    const finalMeasurements = unique(
+      measurementsSummary
+        .map((m: any) => (typeof m === "string" ? finalMedicalNormalize(m.trim()) : ""))
+        .filter(Boolean)
     );
 
-    /* ================= WNIOSKI ================= */
+    // ===== WNIOSKI =====
+    const wnioskiFromImpression: string[] = Array.isArray(impression.doctorKeyConcerns)
+      ? impression.doctorKeyConcerns
+          .filter((x: any) => typeof x === "string")
+          .map((s: string) => finalMedicalNormalize(s.trim()))
+          .filter(Boolean)
+      : [];
 
-    const conclusions = resolveConclusions({ facts, impression });
-    lines.push(
-      ...renderListSection("WNIOSKI", limitRepeatedLines(conclusions, { maxRepeats: 2, keep: 1 }))
-    );
+    const fallbackSummary =
+      typeof analysis.summary === "string" && analysis.summary.trim().length
+        ? [finalMedicalNormalize(analysis.summary.trim())]
+        : [];
 
-    /* ================= ZALECENIA ================= */
+    const finalWnioski = unique(wnioskiFromImpression.length ? wnioskiFromImpression : fallbackSummary);
 
-    const recommendationsRaw: string[] = Array.isArray(impression?.doctorPlan)
+    // ===== ZALECENIA / RED FLAGS =====
+    const zalecenia: string[] = Array.isArray(impression.doctorPlan)
       ? impression.doctorPlan
+          .filter((x: any) => typeof x === "string")
+          .map((s: string) => finalMedicalNormalize(s.trim()))
+          .filter(Boolean)
       : [];
-    const recommendations = limitRepeatedLines(recommendationsRaw, { maxRepeats: 2, keep: 1 });
-    lines.push(...renderListSection("ZALECENIA", recommendations));
 
-    /* ================= OBJAWY ALARMOWE ================= */
-
-    const redFlagsRaw: string[] = Array.isArray(impression?.doctorRedFlags)
+    const redFlags: string[] = Array.isArray(impression.doctorRedFlags)
       ? impression.doctorRedFlags
+          .filter((x: any) => typeof x === "string")
+          .map((s: string) => finalMedicalNormalize(s.trim()))
+          .filter(Boolean)
       : [];
-    const redFlags = limitRepeatedLines(redFlagsRaw, { maxRepeats: 2, keep: 1 });
-    lines.push(...renderListSection("OBJAWY ALARMOWE", redFlags));
 
-    /* ================= Footer ================= */
+    // ===== Raport (plain text) =====
+    const nowPL = new Date().toLocaleString("pl-PL");
 
-    lines.push("Uwaga: Dokument został automatycznie wygenerowany na podstawie transkrypcji i analizy AI.");
-    lines.push("Wymagana jest weryfikacja i zatwierdzenie przez lekarza.");
+    const out: string[] = [];
+    out.push("RAPORT BADANIA: USG jamy brzusznej");
+    out.push(`Data wygenerowania: ${nowPL}`);
+    if (patientName) out.push(`Pacjent: ${patientName}`);
 
-    // Celowo: brak transkrypcji w raporcie — żadnego doklejania transcriptRaw.
-    const reportText = lines.join("\n");
+    out.push("");
+    out.push("POWÓD BADANIA:");
+    out.push(reason ? `- ${finalMedicalNormalize(reason)}` : "- Nie podano w transkrypcji.");
 
-    /* ================= Save ================= */
+    out.push("");
+    out.push("WARUNKI BADANIA:");
+    if (conditions.length) conditions.forEach((c) => out.push(`- ${c}`));
+    else out.push("—");
+
+    out.push("");
+    out.push("OPIS BADANIA:");
+    if (findings.length) findings.forEach((f) => out.push(`- ${f}`));
+    else out.push("—");
+
+    out.push("");
+    out.push("POMIARY:");
+    if (finalMeasurements.length) finalMeasurements.forEach((m) => out.push(`- ${m}`));
+    else out.push("—");
+
+    out.push("");
+    out.push("WNIOSKI:");
+    if (finalWnioski.length) finalWnioski.forEach((w) => out.push(`- ${w}`));
+    else out.push("—");
+
+    out.push("");
+    out.push("ZALECENIA:");
+    if (zalecenia.length) zalecenia.forEach((z) => out.push(`- ${z}`));
+    else out.push("—");
+
+    out.push("");
+    out.push("OBJAWY ALARMOWE:");
+    if (redFlags.length) redFlags.forEach((r) => out.push(`- ${r}`));
+    else out.push("—");
+
+    out.push("");
+    out.push("Uwaga: Dokument został automatycznie wygenerowany na podstawie transkrypcji i analizy AI.");
+    out.push("Wymagana jest weryfikacja i zatwierdzenie przez lekarza.");
+
+    let report = out.join("\n");
+
+    // HARD post-normalize (gwarantuje poprawę nawet jeśli coś ominęło normalizację linii)
+    report = finalMedicalNormalize(report);
+
+    // Optional final LLM polish (only typos/terminology/style; must keep structure)
+    report = await polishReportWithLLM(report);
 
     await ref.update({
-      report: reportText,
+      report,
       reportMeta: {
-        version: REPORT_VERSION,
-        generatedAt: new Date(),
+        generatedAt: FieldValue.serverTimestamp(),
         sanitize: Boolean(sanitize),
-        useLLM: Boolean(useLLM),
-      },
+        useLLM: false,
+        version: REPORT_VERSION,
+        tookMs: Date.now() - t0,
+        status: "in_progress"
+      }
     });
 
-    return NextResponse.json({
-      ok: true,
-      docPath: ref.path,
-      reportPreview: reportText,
-    });
+    return NextResponse.json({ ok: true, reportPreview: report, docPath: ref.path });
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message ?? "Unknown error" }, { status: 500 });
+    return NextResponse.json({ ok: false, error: e?.message || "Unknown error" }, { status: 500 });
   }
 }
