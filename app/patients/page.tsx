@@ -2,11 +2,12 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Box, Chip, Paper, Stack, Typography } from "@mui/material";
+import { Box, Chip, Grid, Paper, Stack, TextField, Typography } from "@mui/material";
 import { PrimaryButton } from "@/app/_components/Buttons";
 import SectionCard from "@/app/_components/SectionCard";
 import PeopleAltOutlinedIcon from "@mui/icons-material/PeopleAltOutlined";
 import PersonSearchOutlinedIcon from "@mui/icons-material/PersonSearchOutlined";
+import SearchOutlinedIcon from "@mui/icons-material/SearchOutlined";
 import { collection, getDocs, query, where, orderBy } from "firebase/firestore";
 import { db } from "@/lib/firebase/client";
 import { getMyClinicId, USER_TS_VERSION } from "@/lib/firebase/user";
@@ -23,6 +24,7 @@ export default function PatientsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>("");
   const [patients, setPatients] = useState<Patient[]>([]);
+  const [queryText, setQueryText] = useState("");
 
   useEffect(() => {
     (async () => {
@@ -50,6 +52,21 @@ export default function PatientsPage() {
     })();
   }, []);
 
+  const filteredPatients = patients.filter((p) => {
+    const q = queryText.trim().toLowerCase();
+    if (!q) return true;
+    const hay = [
+      p.name,
+      p.species,
+      p.breed,
+      p.ownerName,
+      p.id,
+    ]
+      .map((v) => (v || "").toString().toLowerCase())
+      .join(" ");
+    return hay.includes(q);
+  });
+
   return (
     <Stack spacing={3}>
       <Stack direction={{ xs: "column", sm: "row" }} spacing={2} justifyContent="space-between">
@@ -62,7 +79,21 @@ export default function PatientsPage() {
           </Typography>
         </Box>
 
-        <Stack direction="row" spacing={1} alignItems="center">
+        <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ xs: "stretch", sm: "center" }}>
+          <TextField
+            value={queryText}
+            onChange={(e) => setQueryText(e.target.value)}
+            placeholder="Szukaj pacjenta..."
+            size="small"
+            InputProps={{
+              startAdornment: (
+                <Box sx={{ color: "text.secondary", mr: 1, display: "grid", placeItems: "center" }}>
+                  <SearchOutlinedIcon fontSize="small" />
+                </Box>
+              ),
+            }}
+            sx={{ minWidth: { xs: "100%", sm: 260 } }}
+          />
           <Chip
             label={`user.ts v${USER_TS_VERSION}`}
             size="small"
@@ -121,52 +152,62 @@ export default function PatientsPage() {
           subtitle="Kliknij pacjenta, aby przejść do karty i badań."
           icon={<PeopleAltOutlinedIcon />}
         >
-          <Stack spacing={2}>
-            {patients.map((p) => {
-              const name = (p.name || "").trim() || "Bez imienia";
-              const species = (p.species || "").trim() || "nieznany gatunek";
-              const breed = (p.breed || "").toString().trim();
-              const ownerName = (p.ownerName || "").toString().trim();
+          {filteredPatients.length === 0 ? (
+            <Typography variant="body2" color="text.secondary">
+              Brak wyników dla „{queryText}”.
+            </Typography>
+          ) : (
+            <Grid container spacing={2}>
+              {filteredPatients.map((p) => {
+                const name = (p.name || "").trim() || "Bez imienia";
+                const species = (p.species || "").trim() || "nieznany gatunek";
+                const breed = (p.breed || "").toString().trim();
+                const ownerName = (p.ownerName || "").toString().trim();
 
-              return (
-                <Paper
-                  key={p.id}
-                  component={Link}
-                  href={`/patients/${p.id}`}
-                  variant="outlined"
-                  sx={{
-                    p: 2,
-                    textDecoration: "none",
-                    display: "block",
-                    transition: "all 150ms ease",
-                    "&:hover": {
-                      borderColor: "primary.light",
-                      boxShadow: "0 12px 30px rgba(15, 23, 42, 0.08)",
-                    },
-                  }}
-                >
-                  <Stack direction="row" spacing={2} alignItems="flex-start">
-                    <Box sx={{ flex: 1, minWidth: 0 }}>
-                      <Typography fontWeight={600}>{name}</Typography>
-                      <Typography variant="body2" color="text.secondary">
+                return (
+                  <Grid key={p.id} item xs={12} sm="auto" md="auto">
+                    <Paper
+                      component={Link}
+                      href={`/patients/${p.id}`}
+                      variant="outlined"
+                      sx={{
+                        p: 2,
+                        textDecoration: "none",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 1,
+                        width: { xs: "100%", sm: 160 },
+                        height: 160,
+                        overflow: "hidden",
+                        transition: "all 150ms ease",
+                        "&:hover": {
+                          borderColor: "primary.light",
+                          boxShadow: "0 12px 30px rgba(15, 23, 42, 0.08)",
+                        },
+                      }}
+                    >
+                      <Typography fontWeight={700} sx={{ lineHeight: 1.2, wordBreak: "break-word" }}>
+                        {name}
+                      </Typography>
+                      <Typography variant="body2" color="text.secondary" sx={{ wordBreak: "break-word" }}>
                         {species}
                         {breed ? ` • ${breed}` : ""}
                       </Typography>
                       {ownerName ? (
-                        <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                        <Typography variant="body2" color="text.secondary" sx={{ wordBreak: "break-word" }}>
                           <Box component="span" color="text.disabled">
                             Właściciel:
                           </Box>{" "}
                           {ownerName}
                         </Typography>
                       ) : null}
-                    </Box>
-                    <Typography color="text.disabled">→</Typography>
-                  </Stack>
-                </Paper>
-              );
-            })}
-          </Stack>
+                      <Box sx={{ mt: "auto", color: "text.disabled" }}>→</Box>
+                    </Paper>
+                  </Grid>
+                );
+              })}
+            </Grid>
+          )}
         </SectionCard>
       )}
     </Stack>

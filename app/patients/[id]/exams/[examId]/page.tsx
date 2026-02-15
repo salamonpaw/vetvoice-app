@@ -1143,247 +1143,233 @@ export default function ExamPage() {
           </PrimaryButton>
         }
       >
-        <Grid container spacing={3} alignItems="stretch">
-          <Grid item xs={12} md={6} sx={{ display: "flex" }}>
-            <Paper
-              variant="outlined"
-              sx={{
-                p: 2,
-                bgcolor: "background.default",
-                minHeight: { xs: 260, md: 300 },
-                height: "100%",
-                width: "100%",
-                flex: 1,
-              }}
-            >
-              <Stack spacing={2}>
-                <Stack direction="row" spacing={1} alignItems="center">
-                  <MicOutlinedIcon fontSize="small" />
-                  <Typography fontWeight={600}>Nagrywanie</Typography>
-                </Stack>
-                <Typography variant="body2" sx={{ fontFamily: "monospace" }}>
-                  {fmtMs(elapsedMs)}
-                </Typography>
-
-                <Stack direction="row" spacing={1} flexWrap="wrap">
-                  <PrimaryButton size="small" disabled={!canStart} onClick={startRecording}>
-                    Start
-                  </PrimaryButton>
-                  <SecondaryButton size="small" disabled={!canPause} onClick={pauseRecording}>
-                    Pauza
-                  </SecondaryButton>
-                  <SecondaryButton size="small" disabled={!canResume} onClick={resumeRecording}>
-                    Wznów
-                  </SecondaryButton>
-                  <SecondaryButton size="small" disabled={!canStop} onClick={stopRecording}>
-                    Stop
-                  </SecondaryButton>
-                </Stack>
-
-                {recordedUrl && (
-                  <Stack spacing={1}>
-                    <audio controls src={recordedUrl} className="w-full" />
-                    <Typography variant="caption" color="text.secondary">
-                      MIME: <span className="font-mono">{recordedMime}</span> • Rozmiar:{" "}
-                      <span className="font-mono">{recordedBlob?.size ?? 0}</span> B
-                    </Typography>
-                  </Stack>
-                )}
-
-                <Stack spacing={1}>
-                  <SecondaryButton size="small" disabled={!canSave} onClick={saveRecordingLocal}>
-                    {savingAudio ? "Zapisuję…" : "Zapisz nagranie"}
-                  </SecondaryButton>
-                  <Typography variant="caption" color="text.secondary">
-                    Zapis lokalny jest wymagany do transkrypcji.
-                  </Typography>
-                </Stack>
+        <Box
+          sx={{
+            display: "grid",
+            gridTemplateColumns: { xs: "1fr", md: "repeat(2, 400px)" },
+            gridAutoRows: "200px",
+            gap: 3,
+            justifyContent: { md: "center" },
+          }}
+        >
+          <Paper
+            variant="outlined"
+            sx={{
+              p: 2,
+              bgcolor: "background.default",
+              width: { xs: "100%", md: 400 },
+              height: 200,
+              overflow: "auto",
+            }}
+          >
+            <Stack spacing={1.5}>
+              <Stack direction="row" spacing={1} alignItems="center">
+                <MicOutlinedIcon fontSize="small" />
+                <Typography fontWeight={600}>Nagrywanie</Typography>
               </Stack>
-            </Paper>
-          </Grid>
-
-          <Grid item xs={12} md={6} sx={{ display: "flex" }}>
-            <Paper
-              variant="outlined"
-              sx={{
-                p: 2,
-                bgcolor: "background.default",
-                minHeight: { xs: 260, md: 300 },
-                height: "100%",
-                width: "100%",
-                flex: 1,
-              }}
-            >
-              <Stack spacing={1.5}>
-                <Stack direction="row" spacing={1} alignItems="center">
-                  <FolderOutlinedIcon fontSize="small" />
-                  <Typography fontWeight={600}>Plik nagrania</Typography>
-                </Stack>
-                {hasLocalRecording ? (
-                  <>
-                    <audio
-                      controls
-                      className="w-full"
-                      src={`/api/recordings/file?path=${encodeURIComponent(exam.recording!.localPath!)}`}
-                    />
-                    <Stack direction="row" spacing={1} alignItems="center">
-                      <Typography
-                        variant="caption"
-                        color="text.secondary"
-                        sx={{
-                          fontFamily: "monospace",
-                          whiteSpace: "nowrap",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          flex: 1,
-                        }}
-                      >
-                        {exam.recording!.localPath}
-                      </Typography>
-                      <SecondaryButton
-                        size="small"
-                        onClick={async () => {
-                          try {
-                            await navigator.clipboard.writeText(
-                              exam.recording!.localPath
-                            );
-                            setOkMsg("Skopiowano ścieżkę nagrania.");
-                          } catch {}
-                        }}
-                        startIcon={<ContentCopyOutlinedIcon fontSize="small" />}
-                      >
-                        Kopiuj
-                      </SecondaryButton>
-                    </Stack>
-                    {exam.recording?.preprocessedLocalPath ? (
-                      <Typography variant="caption" color="text.secondary">
-                        Plik oczyszczony zapisany.
-                      </Typography>
-                    ) : null}
-                  </>
-                ) : (
-                  <Typography variant="caption" color="text.secondary">
-                    Brak nagrania.
-                  </Typography>
-                )}
-              </Stack>
-            </Paper>
-          </Grid>
-
-          <Grid item xs={12} md={6} sx={{ display: "flex" }}>
-            <Paper
-              variant="outlined"
-              sx={{
-                p: 2,
-                bgcolor: "background.default",
-                minHeight: { xs: 260, md: 300 },
-                height: "100%",
-                width: "100%",
-                flex: 1,
-              }}
-            >
-              <Stack spacing={2}>
-                <Stack direction="row" spacing={1} alignItems="center">
-                  <CloudUploadOutlinedIcon fontSize="small" />
-                  <Typography fontWeight={600}>Import nagrania</Typography>
-                </Stack>
-                <Typography
-                  variant="caption"
-                  color="text.secondary"
-                  sx={{
-                    display: "-webkit-box",
-                    WebkitLineClamp: 2,
-                    WebkitBoxOrient: "vertical",
-                    overflow: "hidden",
-                  }}
-                >
-                  Wgraj gotowy plik audio (mp3, m4a, wav, ogg, webm). Zostanie zapisany lokalnie i podpięty do badania.
-                </Typography>
-
-                <Stack spacing={1.5}>
-                  <SecondaryButton component="label" size="small" disabled={uiLocked}>
-                    Wybierz plik audio
-                    <input
-                      type="file"
-                      accept="audio/*"
-                      hidden
-                      onChange={(e) => {
-                        const f = e.target.files?.[0] || null;
-                        setImportFile(f);
-                      }}
-                    />
-                  </SecondaryButton>
-
-                  <FormControlLabel
-                    control={
-                      <Checkbox
-                        checked={importRunPipeline}
-                        onChange={(e) => setImportRunPipeline(e.target.checked)}
-                        disabled={uiLocked}
-                      />
-                    }
-                    label="Automatycznie uruchom generowanie raportu"
-                  />
-
-                  <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
-                    <SecondaryButton
-                      size="small"
-                      disabled={uiLocked || !importFile}
-                      onClick={importRecordingFile}
-                    >
-                      {importing ? "Importuję…" : "Wgraj do badania"}
-                    </SecondaryButton>
-
-                    <Typography variant="caption" color="text.secondary">
-                      {importFile
-                        ? `Wybrano: ${importFile.name} • ${Math.round(importFile.size / 1024)} KB`
-                        : "Nie wybrano pliku"}
-                    </Typography>
-                  </Stack>
-                </Stack>
-              </Stack>
-            </Paper>
-          </Grid>
-
-          <Grid item xs={12} md={6} sx={{ display: "flex" }}>
-            <Paper
-              variant="outlined"
-              sx={{
-                p: 2,
-                bgcolor: "background.default",
-                minHeight: { xs: 260, md: 300 },
-                height: "100%",
-                width: "100%",
-                flex: 1,
-              }}
-            >
-              <Stack spacing={1.5}>
-                <Stack direction="row" spacing={1} alignItems="center">
-                  <GraphicEqOutlinedIcon fontSize="small" />
-                  <Typography fontWeight={600}>Transkrypcja</Typography>
-                </Stack>
-                <Typography
-                  variant="caption"
-                  color="text.secondary"
-                  sx={{
-                    display: "-webkit-box",
-                    WebkitLineClamp: 2,
-                    WebkitBoxOrient: "vertical",
-                    overflow: "hidden",
-                  }}
-                >
-                  Włącz podgląd transkrypcji w osobnej sekcji.
-                </Typography>
-                <SecondaryButton
-                  size="small"
-                  onClick={() => setShowTranscriptSection((v) => !v)}
-                >
-                  {showTranscriptSection ? "Ukryj transkrypcję" : "Zobacz transkrypcję"}
+              <Typography variant="body2" sx={{ fontFamily: "monospace" }}>
+                {fmtMs(elapsedMs)}
+              </Typography>
+              <Stack direction="row" spacing={1} flexWrap="wrap">
+                <PrimaryButton size="small" disabled={!canStart} onClick={startRecording}>
+                  Start
+                </PrimaryButton>
+                <SecondaryButton size="small" disabled={!canPause} onClick={pauseRecording}>
+                  Pauza
+                </SecondaryButton>
+                <SecondaryButton size="small" disabled={!canResume} onClick={resumeRecording}>
+                  Wznów
+                </SecondaryButton>
+                <SecondaryButton size="small" disabled={!canStop} onClick={stopRecording}>
+                  Stop
                 </SecondaryButton>
               </Stack>
-            </Paper>
-          </Grid>
-        </Grid>
+              {recordedUrl && (
+                <Stack spacing={1}>
+                  <audio controls src={recordedUrl} className="w-full" />
+                  <Typography variant="caption" color="text.secondary">
+                    MIME: <span className="font-mono">{recordedMime}</span> • Rozmiar:{" "}
+                    <span className="font-mono">{recordedBlob?.size ?? 0}</span> B
+                  </Typography>
+                </Stack>
+              )}
+              <Stack spacing={1}>
+                <SecondaryButton size="small" disabled={!canSave} onClick={saveRecordingLocal}>
+                  {savingAudio ? "Zapisuję…" : "Zapisz nagranie"}
+                </SecondaryButton>
+                <Typography variant="caption" color="text.secondary">
+                  Zapis lokalny jest wymagany do transkrypcji.
+                </Typography>
+              </Stack>
+            </Stack>
+          </Paper>
+
+          <Paper
+            variant="outlined"
+            sx={{
+              p: 2,
+              bgcolor: "background.default",
+              width: { xs: "100%", md: 400 },
+              height: 200,
+              overflow: "auto",
+            }}
+          >
+            <Stack spacing={1.5}>
+              <Stack direction="row" spacing={1} alignItems="center">
+                <FolderOutlinedIcon fontSize="small" />
+                <Typography fontWeight={600}>Plik nagrania</Typography>
+              </Stack>
+              {hasLocalRecording ? (
+                <>
+                  <audio
+                    controls
+                    className="w-full"
+                    src={`/api/recordings/file?path=${encodeURIComponent(exam.recording!.localPath!)}`}
+                  />
+                  <Stack direction="row" spacing={1} alignItems="center">
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      sx={{
+                        fontFamily: "monospace",
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        flex: 1,
+                      }}
+                    >
+                      {exam.recording!.localPath}
+                    </Typography>
+                    <SecondaryButton
+                      size="small"
+                      onClick={async () => {
+                        try {
+                          await navigator.clipboard.writeText(
+                            exam.recording!.localPath
+                          );
+                          setOkMsg("Skopiowano ścieżkę nagrania.");
+                        } catch {}
+                      }}
+                      startIcon={<ContentCopyOutlinedIcon fontSize="small" />}
+                    >
+                      Kopiuj
+                    </SecondaryButton>
+                  </Stack>
+                  {exam.recording?.preprocessedLocalPath ? (
+                    <Typography variant="caption" color="text.secondary">
+                      Plik oczyszczony zapisany.
+                    </Typography>
+                  ) : null}
+                </>
+              ) : (
+                <Typography variant="caption" color="text.secondary">
+                  Brak nagrania.
+                </Typography>
+              )}
+            </Stack>
+          </Paper>
+
+          <Paper
+            variant="outlined"
+            sx={{
+              p: 2,
+              bgcolor: "background.default",
+              width: { xs: "100%", md: 400 },
+              height: 200,
+              overflow: "auto",
+            }}
+          >
+            <Stack spacing={1.5}>
+              <Stack direction="row" spacing={1} alignItems="center">
+                <CloudUploadOutlinedIcon fontSize="small" />
+                <Typography fontWeight={600}>Import nagrania</Typography>
+              </Stack>
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{
+                  display: "-webkit-box",
+                  WebkitLineClamp: 2,
+                  WebkitBoxOrient: "vertical",
+                  overflow: "hidden",
+                }}
+              >
+                Wgraj gotowy plik audio (mp3, m4a, wav, ogg, webm). Zostanie zapisany lokalnie i podpięty do badania.
+              </Typography>
+              <Stack spacing={1.5}>
+                <SecondaryButton component="label" size="small" disabled={uiLocked}>
+                  Wybierz plik audio
+                  <input
+                    type="file"
+                    accept="audio/*"
+                    hidden
+                    onChange={(e) => {
+                      const f = e.target.files?.[0] || null;
+                      setImportFile(f);
+                    }}
+                  />
+                </SecondaryButton>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={importRunPipeline}
+                      onChange={(e) => setImportRunPipeline(e.target.checked)}
+                      disabled={uiLocked}
+                    />
+                  }
+                  label="Automatycznie uruchom generowanie raportu"
+                />
+                <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+                  <SecondaryButton
+                    size="small"
+                    disabled={uiLocked || !importFile}
+                    onClick={importRecordingFile}
+                  >
+                    {importing ? "Importuję…" : "Wgraj do badania"}
+                  </SecondaryButton>
+                  <Typography variant="caption" color="text.secondary">
+                    {importFile
+                      ? `Wybrano: ${importFile.name} • ${Math.round(importFile.size / 1024)} KB`
+                      : "Nie wybrano pliku"}
+                  </Typography>
+                </Stack>
+              </Stack>
+            </Stack>
+          </Paper>
+
+          <Paper
+            variant="outlined"
+            sx={{
+              p: 2,
+              bgcolor: "background.default",
+              width: { xs: "100%", md: 400 },
+              height: 200,
+              overflow: "auto",
+            }}
+          >
+            <Stack spacing={1.5}>
+              <Stack direction="row" spacing={1} alignItems="center">
+                <GraphicEqOutlinedIcon fontSize="small" />
+                <Typography fontWeight={600}>Transkrypcja</Typography>
+              </Stack>
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{
+                  display: "-webkit-box",
+                  WebkitLineClamp: 2,
+                  WebkitBoxOrient: "vertical",
+                  overflow: "hidden",
+                }}
+              >
+                Włącz podgląd transkrypcji w osobnej sekcji.
+              </Typography>
+              <SecondaryButton size="small" onClick={() => setShowTranscriptSection((v) => !v)}>
+                {showTranscriptSection ? "Ukryj transkrypcję" : "Zobacz transkrypcję"}
+              </SecondaryButton>
+            </Stack>
+          </Paper>
+        </Box>
       </SectionCard>
 
       {showTranscriptSection && (hasLocalRecording || hasTranscript) && (
