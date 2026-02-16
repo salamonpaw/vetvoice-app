@@ -3,11 +3,6 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { Box, Chip, Grid, Paper, Stack, Typography } from "@mui/material";
-import SectionCard from "@/app/_components/SectionCard";
-import { PrimaryButton, SecondaryButton } from "@/app/_components/Buttons";
-import AssignmentOutlinedIcon from "@mui/icons-material/AssignmentOutlined";
-import PetsOutlinedIcon from "@mui/icons-material/PetsOutlined";
 import {
   collection,
   doc,
@@ -19,6 +14,9 @@ import {
 } from "firebase/firestore";
 import { db } from "@/lib/firebase/client";
 import { getMyClinicId } from "@/lib/firebase/user";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 
 type Patient = {
   id: string;
@@ -36,18 +34,33 @@ type ExamListItem = {
   createdAt?: Timestamp | null;
 };
 
+type ExamGroup = {
+  key: string;
+  title: string;
+  items: ExamListItem[];
+  newestMs: number;
+};
+
 function statusLabel(status?: string) {
   const s = (status || "draft").toLowerCase();
   if (s === "in_progress") return "w trakcie";
   if (s === "done") return "zakończone";
-  return "szkic";
+  return "robocze";
 }
 
-function statusChipColor(status?: string) {
+function statusBadgeClass(status?: string) {
   const s = (status || "draft").toLowerCase();
-  if (s === "in_progress") return "warning";
-  if (s === "done") return "success";
-  return "default";
+  if (s === "in_progress") return "border-amber-200 bg-amber-50 text-amber-800";
+  if (s === "done") return "border-emerald-200 bg-emerald-50 text-emerald-800";
+  return "border-slate-200 bg-slate-50 text-slate-700";
+}
+
+function examTimeMs(exam: ExamListItem) {
+  const t = exam.createdAt as any;
+  if (!t) return 0;
+  if (typeof t.toMillis === "function") return t.toMillis();
+  if (typeof t.toDate === "function") return t.toDate().getTime();
+  return 0;
 }
 
 export default function PatientDetailsPage() {
@@ -86,7 +99,6 @@ export default function PatientDetailsPage() {
         const clinicId = await getMyClinicId();
         if (cancelled) return;
 
-        // 1) Pacjent
         const patientRef = doc(db, "patients", patientId);
         const patientSnap = await getDoc(patientRef);
 
@@ -111,7 +123,6 @@ export default function PatientDetailsPage() {
           ownerName: p?.ownerName ?? null,
         });
 
-        // 2) Badania
         const examsQ = query(
           collection(db, "patients", patientId, "exams"),
           orderBy("createdAt", "desc")
@@ -148,189 +159,200 @@ export default function PatientDetailsPage() {
 
   const examNewHref = patientId ? `/patients/${patientId}/exams/new` : "/patients";
 
+  const groupedExams = useMemo<ExamGroup[]>(() => {
+    const map = new Map<string, ExamListItem[]>();
+    for (const exam of exams) {
+      const raw = ((exam.type as string) || (exam as any).title || "").trim();
+      const key = raw || "Inne";
+      const list = map.get(key) ?? [];
+      list.push(exam);
+      map.set(key, list);
+    }
+
+    const groups: ExamGroup[] = Array.from(map.entries()).map(
+      ([key, items]) => {
+        const sorted = [...items].sort((a, b) => examTimeMs(b) - examTimeMs(a));
+        return {
+          key,
+          title: key,
+          items: sorted,
+          newestMs: examTimeMs(sorted[0] ?? { id: "" }),
+        };
+      }
+    );
+
+    groups.sort((a, b) => b.newestMs - a.newestMs);
+    return groups;
+  }, [exams]);
+
   return (
-    <Stack spacing={3}>
-      <Stack
-        direction={{ xs: "column", sm: "row" }}
-        spacing={2}
-        justifyContent="space-between"
-      >
-        <Stack direction="row" spacing={2} alignItems="center">
-          <SecondaryButton component={Link} href="/patients" variant="text">
-            ← Wróć
-          </SecondaryButton>
-          <Box>
-            <Typography variant="h5" fontWeight={700}>
+    <div className="space-y-6">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-center gap-3">
+          <Button variant="ghost" size="sm" asChild>
+            <Link href="/patients">← Wróć</Link>
+          </Button>
+          <div>
+            <h1 className="text-xl font-semibold text-slate-900">
               Karta pacjenta
-            </Typography>
-            <Typography variant="body2" color="text.secondary">
+            </h1>
+            <p className="text-sm text-slate-500">
               Dane pacjenta i lista badań.
-            </Typography>
-          </Box>
-        </Stack>
+            </p>
+          </div>
+        </div>
 
-        <PrimaryButton component={Link} href={examNewHref}>
-          Rozpocznij badanie
-        </PrimaryButton>
-      </Stack>
+        <Button asChild>
+          <Link href={examNewHref}>Rozpocznij badanie</Link>
+        </Button>
+      </div>
 
-      {/* Alerts */}
       {loading && (
-        <Paper variant="outlined" sx={{ p: 3 }}>
-          <Typography variant="body2">Ładowanie…</Typography>
-        </Paper>
+        <Card>
+          <CardContent className="p-4 text-sm text-slate-600">
+            Ładowanie…
+          </CardContent>
+        </Card>
       )}
+
       {error && !loading && (
-        <Paper
-          variant="outlined"
-          sx={{ p: 3, borderColor: "error.light", bgcolor: "error.50" }}
-        >
-          <Typography fontWeight={600}>Błąd</Typography>
-          <Typography variant="body2" sx={{ mt: 1 }}>
-            {error}
-          </Typography>
-        </Paper>
+        <Card className="border-red-200 bg-red-50">
+          <CardContent className="p-4 text-sm text-red-800">
+            <div className="font-semibold">Błąd</div>
+            <div className="mt-1">{error}</div>
+          </CardContent>
+        </Card>
       )}
 
       {!loading && !error && patient && (
-        <Grid container spacing={3}>
-          {/* Patient card */}
-          <Grid item xs={12} lg={4}>
-            <SectionCard
-              title="Pacjent"
-              subtitle="Najważniejsze dane pacjenta."
-              icon={<PetsOutlinedIcon />}
-              fullHeight
-            >
-              <Box>
-                <Typography variant="h6" fontWeight={700}>
+        <div className="space-y-6">
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle>Pacjent</CardTitle>
+            </CardHeader>
+            <CardContent className="grid gap-3 sm:grid-cols-2">
+              <div>
+                <div className="text-lg font-semibold text-slate-900">
                   {patient.name?.trim() || "Bez imienia"}
-                </Typography>
-
-                <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                </div>
+                <div className="text-sm text-slate-600">
                   {(patient.species?.trim() || "nieznany gatunek") +
                     (patient.breed?.toString().trim()
                       ? ` • ${patient.breed.toString().trim()}`
                       : "")}
-                </Typography>
-
+                </div>
                 {patient.ownerName?.toString().trim() ? (
-                  <Typography variant="body2" color="text.secondary" sx={{ mt: 1.5 }}>
-                    <Box component="span" color="text.disabled">
-                      Właściciel:
-                    </Box>{" "}
+                  <div className="mt-2 text-sm text-slate-600">
+                    <span className="text-slate-500">Właściciel:</span>{" "}
                     {patient.ownerName.toString().trim()}
-                  </Typography>
+                  </div>
                 ) : null}
+              </div>
+              <div>
+                <div className="text-xs text-slate-500">ID</div>
+                <div className="mt-1 break-all rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-mono text-slate-700">
+                  {patient.id}
+                </div>
+              </div>
+            </CardContent>
+          </Card>
 
-                <Paper variant="outlined" sx={{ mt: 2, p: 2, bgcolor: "background.default" }}>
-                  <Typography variant="caption" color="text.secondary">
-                    ID
-                  </Typography>
-                  <Typography
-                    variant="caption"
-                    sx={{ display: "block", mt: 0.5, fontFamily: "monospace" }}
-                  >
-                    {patient.id}
-                  </Typography>
-                </Paper>
-              </Box>
-            </SectionCard>
-          </Grid>
-
-          {/* Exams */}
-          <Grid item xs={12} lg={8}>
-            <SectionCard
-              title="Badania"
-              subtitle="Kliknij badanie, aby wejść do nagrania i raportu."
-              icon={<AssignmentOutlinedIcon />}
-              fullHeight
-            >
-
-              {examsLoading && (
-                <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+          <div className="space-y-4">
+            {examsLoading && (
+              <Card>
+                <CardContent className="p-4 text-sm text-slate-600">
                   Ładowanie badań…
-                </Typography>
-              )}
-              {examsError && !examsLoading && (
-                <Paper
-                  variant="outlined"
-                  sx={{ mt: 1, p: 2, borderColor: "error.light", bgcolor: "error.50" }}
-                >
-                  <Typography fontWeight={600}>Błąd</Typography>
-                  <Typography variant="body2" sx={{ mt: 1 }}>
-                    {examsError}
-                  </Typography>
-                </Paper>
-              )}
+                </CardContent>
+              </Card>
+            )}
 
-              {!examsLoading && !examsError && exams.length === 0 && (
-                <Paper
-                  variant="outlined"
-                  sx={{ mt: 1, p: 2, bgcolor: "background.default" }}
-                >
-                  <Typography fontWeight={600}>Brak badań</Typography>
-                  <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                    Utwórz pierwsze badanie, aby rozpocząć dokumentowanie wizyty.
-                  </Typography>
-                </Paper>
-              )}
+            {examsError && !examsLoading && (
+              <Card className="border-red-200 bg-red-50">
+                <CardContent className="p-4 text-sm text-red-800">
+                  <div className="font-semibold">Błąd</div>
+                  <div className="mt-1">{examsError}</div>
+                </CardContent>
+              </Card>
+            )}
 
-              {!examsLoading && !examsError && exams.length > 0 && (
-                <Stack spacing={2} sx={{ mt: 1 }}>
-                  {exams.map((ex) => (
-                    <Paper
-                      key={ex.id}
-                      component={Link}
-                      href={`/patients/${patientId}/exams/${ex.id}`}
-                      variant="outlined"
-                      sx={{
-                        p: 2,
-                        textDecoration: "none",
-                        display: "block",
-                        transition: "all 150ms ease",
-                        "&:hover": {
-                          borderColor: "primary.light",
-                          boxShadow: "0 12px 30px rgba(15, 23, 42, 0.08)",
-                        },
-                      }}
-                    >
-                      <Stack
-                        direction={{ xs: "column", sm: "row" }}
-                        spacing={2}
-                        justifyContent="space-between"
-                        alignItems={{ sm: "center" }}
-                      >
-                        <Box sx={{ minWidth: 0 }}>
-                          <Typography fontWeight={600}>
-                            {(ex.type || "Badanie").toString()}
-                          </Typography>
+            {!examsLoading && !examsError && groupedExams.length === 0 && (
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle>Brak badań</CardTitle>
+                </CardHeader>
+                <CardContent className="flex flex-col gap-3 text-sm text-slate-600">
+                  Utwórz pierwsze badanie, aby rozpocząć dokumentowanie wizyty.
+                  <div>
+                    <Button asChild size="sm">
+                      <Link href={examNewHref}>Rozpocznij badanie</Link>
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
 
-                          <Stack direction="row" spacing={1} sx={{ mt: 1 }} alignItems="center">
-                            <Chip
-                              size="small"
-                              label={statusLabel(ex.status)}
-                              color={statusChipColor(ex.status)}
-                              variant="outlined"
-                            />
-                            <Typography variant="caption" color="text.secondary">
-                              {ex.createdAt
-                                ? ex.createdAt.toDate().toLocaleString()
-                                : ""}
-                            </Typography>
-                          </Stack>
-                        </Box>
+            {!examsLoading &&
+              !examsError &&
+              groupedExams.map((group) => (
+                <Card key={group.key}>
+                  <CardHeader className="pb-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <CardTitle>{group.title}</CardTitle>
+                      <span className="text-xs text-slate-500">
+                        • {group.items.length}
+                      </span>
+                    </div>
+                  </CardHeader>
+                  <CardContent className="pt-0">
+                    <div className="divide-y divide-slate-200">
+                      {group.items.map((ex) => {
+                        const dateText = ex.createdAt
+                          ? ex.createdAt.toDate().toLocaleString("pl-PL")
+                          : "—";
+                        const examTitle = ((ex.type as string) || (ex as any).title || "Badanie").toString();
+                        return (
+                          <Link
+                            key={ex.id}
+                            href={`/patients/${patientId}/exams/${ex.id}`}
+                            className="group flex w-full items-center justify-between gap-3 px-2 py-3 text-left transition hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-300"
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="text-sm font-semibold text-slate-900">
+                                {examTitle}
+                              </div>
+                              <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500 sm:hidden">
+                                <Badge
+                                  className={statusBadgeClass(ex.status)}
+                                  variant="outline"
+                                >
+                                  {statusLabel(ex.status)}
+                                </Badge>
+                                <span>{dateText}</span>
+                              </div>
+                            </div>
 
-                        <Typography color="text.disabled">→</Typography>
-                      </Stack>
-                    </Paper>
-                  ))}
-                </Stack>
-              )}
-            </SectionCard>
-          </Grid>
-        </Grid>
+                            <div className="hidden items-center gap-3 sm:flex">
+                              <Badge
+                                className={statusBadgeClass(ex.status)}
+                                variant="outline"
+                              >
+                                {statusLabel(ex.status)}
+                              </Badge>
+                              <span className="text-xs text-slate-500">
+                                {dateText}
+                              </span>
+                              <span className="text-slate-400">→</span>
+                            </div>
+                          </Link>
+                        );
+                      })}
+                    </div>
+                  </CardContent>
+                </Card>
+              ))}
+          </div>
+        </div>
       )}
-    </Stack>
+    </div>
   );
 }
